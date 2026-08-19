@@ -1,0 +1,62 @@
+# Ansible collection release -- reusable composite workflow (Layer 2).
+#
+# Composes:
+#   - pleme-io/actions/ansible-collection-build@main
+#   - pleme-io/actions/ansible-collection-publish@main
+#   - softprops/action-gh-release@v2 (GitHub Release on tag pushes)
+#
+# Consumer (.github/workflows/release.yml):
+#   on: { push: { tags: ['v*'] }, workflow_dispatch: {} }
+#   jobs:
+#     release:
+#       uses: pleme-io/substrate/.github/workflows/ansible-collection-release.yml@main
+#       secrets:
+#         ANSIBLE_GALAXY_TOKEN: ${{ secrets.ANSIBLE_GALAXY_TOKEN }}
+#
+# Publish gating: GitHub Actions DOES NOT permit referencing `secrets.X` inside
+# an `if:` expression on reusable-workflow-called jobs (the secret name is not
+# resolved at expression-eval time). We therefore inline-gate the publish step
+# inside its run script -- the substrate publish action itself short-circuits
+# cleanly when ANSIBLE_GALAXY_TOKEN is empty, so the step is always safe to run.
+
+name: Ansible collection release
+
+on:
+  workflow_call:
+    secrets:
+      ANSIBLE_GALAXY_TOKEN:
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    # A reusable workflow's `runs-on` executes in the CALLER's billing
+    # context, so a bare metered label here charges every PRIVATE consumer.
+    # That is what exhausted the org's Actions spending limit on 2026-08-08,
+    # after which every private repo's release path failed INSTANTLY with
+    # zero steps — which reads as "autobump/autorelease is broken" rather
+    # than "billing blocked". Public callers keep the exact label they had.
+    runs-on: ${{ github.event.repository.private && 'camelot-builder-pleme-eks' || 'ubuntu-latest' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: build
+        uses: pleme-io/actions/ansible-collection-build@main
+
+      - name: Publish to Ansible Galaxy (no-op if token unset)
+        uses: pleme-io/actions/ansible-collection-publish@main
+        env:
+          ANSIBLE_GALAXY_TOKEN: ${{ secrets.ANSIBLE_GALAXY_TOKEN }}
+
+      - shell: bash
+        run: sha256sum ${{ steps.build.outputs.tarball-path }} | tee collection.sha256
+
+      - if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            ${{ steps.build.outputs.tarball-path }}
+            collection.sha256

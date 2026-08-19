@@ -1,0 +1,325 @@
+# Rust crate CI -- reusable composite workflow (Layer 2).
+#
+# ── WHAT THIS ACTUALLY RUNS (2026-07-27) ────────────────────────────────
+#
+# Two jobs, and the split is the whole point:
+#
+#   flake-check  `nix flake check`, then a gate asserting the flake exposed
+#                at least one check and PRINTING their names. `nix flake
+#                check` builds `checks.<system>.*` and NOTHING ELSE —
+#                packages/devShells/apps are only EVALUATED (nix literally
+#                prints "(build skipped)"). So on a flake with zero checks
+#                this command is an eval-only check.
+#   cargo-test   `cargo test` inside the flake's devShell, on the runner.
+#                This is the leg that actually executes the crate's tests
+#                for every consumer today.
+#
+# ── THE HEADER THAT USED TO BE HERE WAS FALSE, AND REPOS RELIED ON IT ──
+#
+# Until this commit lines 12-15 claimed this workflow "runs whatever
+# `checks.<system>.*` the flake exposes (usually `cargo test` via the
+# substrate baseline)". There was no such baseline: `lib/build/rust/
+# library.nix` returned `{ packages, devShells, apps }` with no `checks`
+# key at all, and `tool-release.nix` emitted only `gen-confirm` (a
+# Cargo.gen.lock delta-freshness gate, never a test run). Consequence,
+# measured rather than inferred:
+#
+#   * a consumer-shaped fixture over `library.nix` at substrate HEAD
+#     reported `checks.<system>` = [] and `nix flake check` exit 0 WITH A
+#     DELIBERATELY FAILING TEST in the crate;
+#   * on `forge`, `nix flake check --impure` returned exit 0 in 8.66s with
+#     `compile_error!` inside `#[cfg(test)] mod tests`, and again with
+#     literal non-Rust garbage replacing a function body.
+#
+# The defect was therefore worse than "tests do not run": the crate was
+# never COMPILED. forge's 45-second green CI was that, not a fast build.
+#
+# ── WHAT CLOSES IT ──────────────────────────────────────────────────────
+#
+# substrate's Rust builders now emit a real verification surface (see
+# lib/build/rust/test-check.nix): `checks.build` on every path, and
+# `checks.tests` wherever substrate can genuinely run tests (the crate2nix
+# path — the gen lockfile path has no dev-dependency graph yet, tracked as
+# `pending-rust-test-check: lockfile-dev-deps`). The `cargo-test` job below
+# is the meanwhile leg, and retires into `checks.tests` when that pending
+# item lands.
+#
+# ── "COVERS EVERY CONSUMER" WAS FALSE THE DAY IT WAS WRITTEN ───────────
+#
+# That is what this header said on 2026-07-27, and it is the sentence that
+# broke the fleet. `cargo-test` reaches every consumer *unconditionally* —
+# it is a runner-side job gated on nothing, so it arrived at all three
+# callers the instant `@main` moved. But REACHING a consumer is not
+# COVERING one. Measured 2026-07-28, `devShells.<sys>.default.name` for
+# every caller of this workflow:
+#
+#   forge      -> "devenv-shell"    (its own devenv.flakeModule; the only
+#                                    pleme-io repo that imports it)
+#   engenho    -> "devenv-shell"    (stale substrate pin, pre-e232917)
+#   iac-forge  -> "devenv-shell"    (stale substrate pin, pre-e232917)
+#
+# `nix develop` cannot enter a devenv shell non-interactively, so the job
+# ran the tests of 0 of its 3 consumers. The gate it replaced was vacuous
+# by ABSENCE (`checks.tests` reached nobody because no consumer sets
+# `buildMode = "cargo-nix"`); this one was vacuous by BREAKAGE. Both verify
+# nothing; the second also turns a working pipeline red.
+#
+# The lesson is the general one, not the devenv specific: a new job added
+# to a SHARED reusable asserts a capability of every consumer, and this one
+# asserted "`.#default` is enterable non-interactively" — which no
+# substrate builder ever guaranteed and which held for none of them. Hence
+# the preflight now wired into nix-devshell-cargo-test.yml, which states
+# that precondition as a checked, actionable verdict instead of an
+# assumption, and the `devshell-args` lever below.
+#
+# Composes:
+#   - pleme-io/actions/nix-flake-check@main
+#   - pleme-io/substrate/.github/workflows/nix-devshell-cargo-test.yml
+#
+# Consumer (.github/workflows/ci.yml) -- unchanged, still 2 lines:
+#   on: [push, pull_request]
+#   jobs:
+#     check:
+#       uses: pleme-io/substrate/.github/workflows/cargo-ci.yml@main
+#       secrets: inherit
+
+name: cargo-ci
+
+on:
+  workflow_call:
+    inputs:
+      flake-args:
+        description: >-
+          Extra arguments appended to `nix flake check`. Empty by default, so
+          every existing caller runs the EXACT same command as before — this
+          input is additive, not a behaviour change.
+
+          The one known use is `--impure`, for a flake that exposes a devenv
+          devShell: `nix flake check` evaluates ALL outputs including
+          devShells, and a devenv shell cannot be evaluated purely (it needs
+          the working directory), so it aborts with "devenv was not able to
+          determine the current directory". That is an eval-time property of
+          devenv, not a defect in the repo being checked.
+        required: false
+        type: string
+        default: ""
+      devshell:
+        description: >-
+          Flake devShell the `cargo test` job runs inside. `default` is what
+          every substrate Rust builder emits (fenix toolchain + the crate's
+          buildInputs). Override when a crate needs a purpose-built shell
+          (e.g. pangea-operator's `ruby-eval`).
+        required: false
+        type: string
+        default: "default"
+      test-args:
+        description: >-
+          Args appended to `cargo test`. The default includes
+          `--all-features` deliberately: on forge, plain `--all-targets` ran
+          2,663 tests while `--all-features` ran 2,950 — an `attestation`
+          feature gated 263 of them. A test gate that silently skips a
+          tenth of the suite is a fresh subject-set vacuity inside the very
+          thing meant to close one. Narrow it here only with a reason.
+        required: false
+        type: string
+        default: "--workspace --all-features --no-fail-fast"
+      build-targets:
+        description: >-
+          Space-separated flake outputs to `nix build` after the flake check,
+          e.g. `.#default`. Empty by default — no build.
+
+          This input exists because migrating a hand-written job to this
+          reusable can SILENTLY DROP coverage. `nix flake check` builds
+          `checks.<system>.*` and nothing else; a repo whose old job ran an
+          explicit `nix build '.#default'` was compiling its actual package,
+          and the shim does not do that unless the flake happens to expose a
+          check covering it. Seven repos (arnes, promessa, remessa,
+          repo-forge, tansa, zuihitsu, engenho-promessa-controllers) carry
+          exactly that step in a hand-written job as of 2026-08-01.
+
+          The same trap as `fmt-check` directly below, found the same way:
+          the migration reads as pure progress while quietly buying less.
+          Pass the targets the old job built rather than assuming flake
+          check subsumes them.
+        required: false
+        type: string
+        default: ""
+      fmt-check:
+        description: >-
+          Run `cargo fmt --all -- --check` in the devShell before the tests.
+          Forwarded to nix-devshell-cargo-test.yml, where the rationale
+          lives. Default `true`: this workflow REPLACED hand-written jobs
+          that carried a fmt gate, and dropping it in the migration was a
+          measured net loss (magma, 2026-08-01, 34 drifted files).
+        required: false
+        type: boolean
+        default: true
+      devshell-args:
+        description: >-
+          Extra arguments for `nix develop` itself, forwarded to the
+          cargo-test job. Empty by default.
+
+          NOT the same thing as `flake-args` above, and deliberately not
+          wired to it: `flake-args` means "extra args for `nix flake
+          check`". Threading one string into two different commands would
+          give it two meanings, and — measured on forge 2026-07-28 — would
+          not even work, because `--impure` is necessary but NOT sufficient
+          to enter a devenv-backed devShell. See the input of the same name
+          in nix-devshell-cargo-test.yml for the full measurement.
+        required: false
+        type: string
+        default: ""
+
+jobs:
+  # ── Runner resolution — the leg this workflow never had ────────────────
+  #
+  # `flake-check` used a bare `runs-on: ubuntu-latest`. On a PUBLIC repo that
+  # is free and correct. On a PRIVATE one it is a GitHub-HOSTED runner billed
+  # against org minutes, so when those are unavailable the job does not fail —
+  # it QUEUES, indefinitely, with no error to read.
+  #
+  # Measured on magma 2026-08-01: with Actions freshly re-enabled, the
+  # dispatched run sat `queued` for 6+ minutes and never started, while the
+  # sibling `cargo-test` leg (which delegates to nix-devshell-cargo-test.yml)
+  # was unaffected. A private consumer of this workflow could not run CI at
+  # all, and the symptom was silence rather than a failure.
+  #
+  # cargo-auto-release.yml has routed by visibility since it was written, and
+  # its own comment names the duplication problem: the identical logic had
+  # been re-derived in three places before `pleme-io/actions/runner-resolve`
+  # was extracted to hold it. This workflow was the fourth site and never
+  # adopted it — so the fix is the resolver, not a fourth copy of the ternary.
+  #
+  # This job's OWN `runs-on` is the one place a visibility-only ternary stays
+  # correct: bootstrapping the resolver cannot call the resolver.
+  resolve-runner:
+    name: resolve build runner
+    runs-on: ${{ github.event.repository.private && 'camelot-builder-pleme-eks' || 'ubuntu-latest' }}
+    outputs:
+      runner: ${{ steps.resolve.outputs.runner }}
+    steps:
+      - id: resolve
+        uses: pleme-io/actions/runner-resolve@main
+        with:
+          public-runner-default: "ubuntu-latest"
+
+  flake-check:
+    needs: resolve-runner
+    runs-on: ${{ needs.resolve-runner.outputs.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # ── THE THIRD CREDENTIAL PATH (wired 2026-08-01) ──────────────────
+      #
+      # There are three, not two, and the step below only covers one of
+      # them. nix-flake-check's own header lays out the first two:
+      #
+      #   pkgs.fetchgit        git clone inside a FOD — no token reaches it
+      #   builtins.fetchTree   nix's GitHub fetcher — honors `access-tokens`
+      #
+      # The third is CARGO ITSELF, running inside gen's
+      # `cargo-build-spec-ifd`. Resolving a workspace makes cargo load the
+      # source of EVERY declared dependency — including optional ones whose
+      # feature is off — so a private `git =` dep is fetched even on a
+      # default-feature build, by cargo's own git, which honors neither
+      # `access-tokens` nor the nix fetcher's token.
+      #
+      # Measured on magma (run 30719121344): flake-check died with
+      #   failed to get `pangea-ruby-eval` as a dependency of `magma-pangea`
+      #   Unable to update https://github.com/pleme-io/pangea-operator#3bdf9b74
+      #   revision 3bdf9b74… not found
+      #   failed to authenticate … via git's `credential.helper`
+      # The "revision not found" is a LIE produced by the auth failure — that
+      # commit exists (verified via the API). Don't chase a stale pin.
+      #
+      # `--system`, not `--global`, and that distinction is the whole fix.
+      # `cargo-build-spec-ifd` sets `__noChroot`, so it sees the host
+      # filesystem — but it runs as a build user with its own HOME, so a
+      # `~/.gitconfig` written here is invisible to it. `/etc/gitconfig` is
+      # read by every git process regardless of HOME, which is why the
+      # sibling cargo-test leg's `--global` form works there (same user) and
+      # would silently do nothing here.
+      #
+      # Scoped to the job: ARC runners are ephemeral pods, so this file dies
+      # with the pod. Skipped entirely when BOT_PAT is absent, leaving a
+      # public-dep-only repo byte-identical to before.
+      # The absent-token guard is in the SHELL, not in `if:`. The `secrets`
+      # context is not available in a step-level `if:` — it renders empty, so
+      # `if: secrets.BOT_PAT != ''` would be permanently false and this step
+      # would never run, on any repo, while looking correct.
+      - name: Configure system git credentials for private cargo git deps
+        env:
+          GIT_AUTH_TOKEN: ${{ secrets.BOT_PAT }}
+        run: |
+          if [ -z "${GIT_AUTH_TOKEN}" ]; then
+            echo "BOT_PAT not set — skipping; a repo with private cargo git deps will fail in flake-check."
+            exit 0
+          fi
+          sudo git config --system \
+            url."https://x-access-token:${GIT_AUTH_TOKEN}@github.com/".insteadOf \
+            "https://github.com/"
+          echo "system git credential rewrite configured"
+
+      - uses: pleme-io/actions/nix-flake-check@main
+        with:
+          flake-args: ${{ inputs.flake-args }}
+          # Without this, a repo with a PRIVATE pleme-io git-crate dep fails
+          # here on an HTTP 404 from api.github.com — nix's own GitHub fetcher
+          # running anonymous. The sibling `cargo-test` leg never had this
+          # problem because nix-devshell-cargo-test carries git-credentials for
+          # CARGO's git; nix's fetcher is a separate credential path and needed
+          # its own wiring. Measured on mado 2026-08-01 (run 30681539821),
+          # where cargo-test cloned private hayai fine and flake-check 404'd on
+          # the same rev in the same run — which is the clearest possible
+          # evidence the two are unrelated mechanisms.
+          #
+          # BOT_PAT first, and the fallback is a courtesy rather than a fix:
+          # the auto-provided GITHUB_TOKEN is scoped to the RUNNING repo, so it
+          # cannot read a different private repo and will still 404. It only
+          # buys the higher authenticated rate limit for public deps. A repo
+          # with private deps needs BOT_PAT to be present; if flake-check 404s
+          # with this wired, that missing org secret is the thing to check.
+          github-token: ${{ secrets.BOT_PAT || secrets.GITHUB_TOKEN }}
+
+      - name: nix build ${{ inputs.build-targets }}
+        if: ${{ inputs.build-targets != '' }}
+        env:
+          # Same private-dep credential path as the flake-check step above:
+          # nix's GitHub fetcher is separate from cargo's git, and runs
+          # anonymous (404 on a private dep) without its own token.
+          GITHUB_TOKEN: ${{ secrets.BOT_PAT || secrets.GITHUB_TOKEN }}
+        run: nix build ${{ inputs.build-targets }}
+
+      # A green `nix flake check` is only as strong as the check set it had
+      # to build. Zero checks is a pass over an unbuilt crate, so it fails
+      # here — loudly, naming the fix — and a non-empty set is PRINTED so a
+      # green run states what it actually verified instead of being opaque.
+      #
+      # The policy is substrate's `lib/util/flake-checks-gate.nix`, not
+      # shell branching and not an inline expression: it throws with the
+      # operator-facing message and `nix eval` propagates that as a non-zero
+      # exit, and living in a file means it is parseable, reviewable and
+      # covered by substrate's own `checks.<system>.flake-checks-gate`.
+      # `checks` absent entirely is handled by `or {}` in the caller here,
+      # so the gate never has to classify a missing-attribute error.
+      - name: Gate -- the flake must expose at least one check
+        run: >-
+          nix eval --impure --raw --expr
+          'import (builtins.getFlake "github:pleme-io/substrate").flakeChecksGatePath {
+             system = builtins.currentSystem;
+             checks = (builtins.getFlake (toString ./.)).checks or {};
+           }'
+
+  cargo-test:
+    # Composes substrate's existing devShell test workflow rather than
+    # re-inlining `nix develop -c cargo test` here (Operating Principle #1:
+    # extend the near-miss, never re-implement it). That workflow already
+    # carries the private-git-dependency credential wiring and the
+    # magic-nix-cache removal.
+    uses: pleme-io/substrate/.github/workflows/nix-devshell-cargo-test.yml@main
+    with:
+      devshell: ${{ inputs.devshell }}
+      test-args: ${{ inputs.test-args }}
+      fmt-check: ${{ inputs.fmt-check }}
+      devshell-args: ${{ inputs.devshell-args }}
+    secrets: inherit

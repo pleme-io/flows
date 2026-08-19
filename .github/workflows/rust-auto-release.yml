@@ -1,0 +1,560 @@
+name: rust-auto-release
+
+# Reusable workflow: on push to main, bump the workspace patch
+# version + commit + tag + push + ship every workspace member to
+# the upstream registry. Auto-renames conflicts, auto-skips
+# already-published, auto-sleeps on rate-limits, auto-defers
+# crates whose deps aren't yet on the registry.
+#
+# Consumer (.github/workflows/auto-release.yml):
+#
+#   on: { push: { branches: [main] } }
+#   jobs:
+#     release:
+#       uses: pleme-io/substrate/.github/workflows/rust-auto-release.yml@main
+#       secrets: inherit
+#
+# Three lines of operator config. Everything else is pure
+# composition of pleme-io/actions/* primitives (each backed by
+# Rust + tatara-lisp).
+#
+# secrets passed through:
+#   CRATES_API_TOKEN — org-level secret; this workflow bridges to
+#                      CARGO_REGISTRY_TOKEN env that cargo reads.
+#   BOT_PAT          — optional PAT with `repo` scope. If present,
+#                      tag pushes can trigger downstream workflows.
+
+on:
+  workflow_call:
+    inputs:
+      bump-type:
+        description: "patch | minor | major"
+        type: string
+        required: false
+        default: patch
+      source-paths:
+        description: "Space-separated git pathspecs the skip-detector inspects for changes since the last tag. Default catches any Rust source (`*.rs`, matched at any depth) + the workspace manifests, so a SOURCE-only change (no Cargo.toml/Cargo.lock edit) still triggers a bump+publish. The old `Cargo.toml Cargo.lock` default silently skipped every source-only push (the 2026-06-03 never-publishing bug). Override for layouts with significant non-`.rs` source."
+        type: string
+        required: false
+        default: "*.rs Cargo.toml Cargo.lock"
+      add-paths:
+        description: >-
+          Space-separated git pathspecs the bump commit stages. Default covers
+          root + all workspace member Cargo.toml files, plus BOTH co-outputs of
+          the `gen build .` that ensure-gen-lock-fresh already runs during the
+          bump (stdlib.tlisp regen-gen-lock, after the version write and before
+          the commit): Cargo.gen.lock AND Cargo.build-spec.json. Only the lock
+          was ever staged, so the regenerated spec died with the runner and
+          every repo that COMMITS its spec (17 fleet-wide, deliberately
+          un-gitignored for no-IFD deterministic builds) went stale on release.
+          Safe for the ~406 repos that DO gitignore it: git-commit-tag stages
+          per-path under exec-check, which returns the status rather than
+          raising, so an ignored (exit 1) or absent (exit 128) pathspec fails
+          alone. Verified empirically, not inferred. No crate-path arm here —
+          this reusable has no such input; a workspace bump always runs at the
+          repo root (hard-errored in rust-workspace-bump/run.tlisp).
+        type: string
+        required: false
+        default: "Cargo.toml Cargo.lock Cargo.nix Cargo.gen.lock Cargo.build-spec.json"
+      rename-prefix:
+        description: "Prefix used when auto-renaming a conflicting crate at registry-publish time."
+        type: string
+        required: false
+        default: "pleme-io-"
+      no-verify:
+        description: "Skip cargo publish's verification compile step."
+        type: string
+        required: false
+        default: "true"
+      # Runner routing: empty default routes by CALLER repo visibility —
+      # private repos → the org-scoped camelot-builder-pleme-eks ARC pool (avoids billed
+      # hosted minutes; org runner groups refuse public repos anyway), public
+      # repos → ubuntu-latest. Schedule-triggered callers (the drip tick) may
+      # lack github.event.repository and fall open to hosted (documented edge).
+      # Do NOT put an expression in this default — workflow_call input
+      # defaults are static; the fallback lives in each job's runs-on.
+      runner:
+        description: "Explicit runner label override; empty = route by caller repo visibility (private → camelot-builder-pleme-eks, public → ubuntu-latest)."
+        type: string
+        required: false
+        default: ""
+      # ── The publish gate ────────────────────────────────────────────────
+      #
+      # Until 2026-08-06 this workflow published 52 crates to crates.io with
+      # NO test job at all: `ship` and `drip` needed only `bump`. Measured
+      # consequence — izumi published 0.1.15 while
+      # `every_provider_in_the_matrix_works` was failing on main.
+      #
+      # `require-tests` is ON by default, fleet-wide, deliberately. A publish
+      # gate that must be opted into is not a gate.
+      require-tests:
+        description: "Block publishing unless the test job passes. Default true. Turning it off REQUIRES require-tests-waiver."
+        type: boolean
+        required: false
+        default: true
+      require-tests-waiver:
+        description: "Typed reason, REQUIRED when require-tests is false. Same grammar as the fleet's `skip-<name>: <typed-reason>`. Time pressure is not a reason."
+        type: string
+        required: false
+        default: ""
+      # PER-REPO by default, not per-crate — measured, not preference.
+      # Counting published crates with zero tests across all 52 consumers:
+      # per-crate blocks 19 of 52 repos on day one (51 zero-test crates,
+      # including 4 in magma, 9 in promessa, 7 in mirante); per-repo blocks 1
+      # (umbra). Per-crate is the destination a repo ratchets into once it has
+      # earned it, not the setting that bricks 37% of the release pipeline the
+      # day the gate lands.
+      test-granularity:
+        description: "repo = the whole workspace run must execute >0 tests. crate = every published member must. Default repo."
+        type: string
+        required: false
+        default: "repo"
+      # Defaults to the CONSUMER's own devShell. Deliberately no value here:
+      # `default` is wrong (substrate itself declares only `selftest-cargo`,
+      # and 25 consumers resolve `default` to a devenv shell `nix develop`
+      # cannot enter non-interactively), so the resolution lives in the job.
+      test-devshell:
+        description: "Flake devShell the test job runs in. Empty = resolve (consumer's default, falling back to substrate's release-gate)."
+        type: string
+        required: false
+        default: ""
+      test-args:
+        description: "Args appended to the test command."
+        type: string
+        required: false
+        default: "--workspace --no-fail-fast"
+    secrets:
+      # required:false, deliberately. GitHub validates the WHOLE reusable call
+      # graph at startup, BEFORE any job `if:` is evaluated, so a
+      # `required: true` here makes every caller of the polymorphic
+      # auto-release.yml fail with startup_failure and zero jobs — including
+      # repos that would never reach this arm. That is the
+      # union-of-required-secrets unsatisfiability this file's sibling comment
+      # already names; ruby-gem was dropped as an arm for it while four arms
+      # kept the same declaration. Absence is caught at publish time instead,
+      # where the error can name the secret and the repo it is missing from.
+      CRATES_API_TOKEN:
+        required: false
+        description: "Registry publish token (crates.io API token with publish scope)."
+      BOT_PAT:
+        required: false
+        description: "Optional PAT with repo scope for cross-workflow tag triggers."
+
+permissions:
+  contents: write
+
+# Serialize releases per repository. Two pushes to main otherwise trigger
+# two bump runs from the same base; the first run's bump-commit push
+# advances main, making the second run's push non-fast-forward — the second
+# bump is then lost. The same group also serializes a */15 drip tick against
+# a still-running push ship (which rides the rate limit for up to 30m) so
+# they don't race for crates.io new-crate tokens. Queue rather than cancel:
+# a release already in flight (commit + tag + publish) must finish. Only the
+# ENTRY workflow's concurrency is honored by GitHub (a nested reusable call
+# inherits the caller's), so the same group across the rust/cargo/polymorphic
+# entrypoints is safe + gives true per-repo serialization.
+concurrency:
+  group: auto-release-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    name: Bump workspace + tag
+    runs-on: ${{ inputs.runner != '' && inputs.runner || (github.event.repository.private && 'camelot-builder-pleme-eks' || 'ubuntu-latest') }}
+    # Skip when the bot itself pushed (avoids tag-push → bump → tag-push loops)
+    # and on the scheduled drip tick (a capacity-ride must never bump/tag).
+    if: github.actor != 'github-actions[bot]' && github.event_name != 'schedule'
+    outputs:
+      bumped: ${{ steps.bump.outputs.bumped }}
+      new-version: ${{ steps.bump.outputs.new-version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.BOT_PAT || secrets.GITHUB_TOKEN }}
+
+      # Private git dependencies. checkout's token is scoped to THIS repo, so a
+      # workspace whose members read a sibling PRIVATE pleme-io repo fails with
+      # cargo's misleading "revision <sha> not found" — the fetch is denied, and
+      # cargo reports the resulting empty clone as a missing rev rather than as
+      # auth. escriba tripped exactly this on zenmai (private).
+      #
+      # cargo-auto-release.yml has carried this on bump+ship since the ~20-repo
+      # private flip (2026-07-23); this workspace sibling never got it. Same fix,
+      # same placement: after checkout, before anything cargo touches.
+      - uses: pleme-io/actions/git-credentials@main
+        with:
+          bot-pat: ${{ secrets.BOT_PAT }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: bump
+        uses: pleme-io/actions/rust-workspace-bump@main
+        with:
+          bump-type: ${{ inputs.bump-type }}
+          source-paths: ${{ inputs.source-paths }}
+
+      - if: steps.bump.outputs.bumped == 'true'
+        uses: pleme-io/actions/git-commit-tag@main
+        with:
+          version: ${{ steps.bump.outputs.new-version }}
+          add-paths: ${{ inputs.add-paths }}
+
+      - if: steps.bump.outputs.bumped == 'true'
+        uses: pleme-io/actions/git-push-with-token@main
+        with:
+          token: ${{ secrets.BOT_PAT || secrets.GITHUB_TOKEN }}
+          branch: main
+          push-tags: "true"
+          # PARITY with cargo-auto-release.yml:218 — this reusable was the
+          # only one of the family missing it. The three lockfiles a bump
+          # touches are all GENERATED, and `gen-spec` fires on the same push
+          # and can finish first, so its regenerated Cargo.gen.lock lands
+          # while this job is still building. Without declaring them
+          # regenerable, git-push-with-token defaults to "" and ABORTS the
+          # rebase on a conflict in a file no human wrote — stranding the
+          # release after the tag already exists. Declaring them resolves in
+          # favour of the bump, which is correct: the bump's copy is the one
+          # generated against the version being released.
+          regenerable-paths: "Cargo.lock Cargo.gen.lock Cargo.build-spec.json"
+
+  waiver:
+    name: Waiver check
+    # Runs on EVERY invocation, including the ones where the gate is off —
+    # that is the whole point. Without this job, `require-tests: false` is a
+    # silent bypass a reviewer would have to notice in a diff; with it, the
+    # opt-out costs a sentence and appears in the run.
+    #
+    # Same grammar as the fleet's `skip-<name>: <typed-reason>` waivers and as
+    # lib/build/rust/test-check.nix's own `tests.enable`/`reason` pair, which
+    # throws with "Turning the test gate off is a decision that must be
+    # recorded at the declaration, not an undocumented flip."
+    # A reusable workflow's `runs-on` executes in the CALLER's billing
+    # context, so a bare metered label here charges every PRIVATE consumer.
+    # That is what exhausted the org's Actions spending limit on 2026-08-08,
+    # after which every private repo's release path failed INSTANTLY with
+    # zero steps — which reads as "autobump/autorelease is broken" rather
+    # than "billing blocked". Public callers keep the exact label they had.
+    runs-on: ${{ github.event.repository.private && 'camelot-builder-pleme-eks' || 'ubuntu-latest' }}
+    steps:
+      - name: A disabled test gate requires a typed reason
+        if: ${{ inputs.require-tests == false && inputs.require-tests-waiver == '' }}
+        run: |
+          echo "::error::require-tests is false with no require-tests-waiver."
+          echo "That combination lets this repo publish to crates.io after a run"
+          echo "that executed ZERO tests. Some crates genuinely have no runnable"
+          echo "test (pure type definitions, generated bindings, a re-export"
+          echo "facade) — but never silently:"
+          echo ""
+          echo "    with:"
+          echo "      require-tests: false"
+          echo "      require-tests-waiver: \"generated bindings only; no hand-authored behaviour\""
+          echo ""
+          echo "Pair it with skip-tests-required: <same reason> at the top of this"
+          echo "repo's CLAUDE.md. Time pressure is not an acceptable reason, and"
+          echo "\"we'll add tests later\" is the state most of this workflow's"
+          echo "consumers are already in."
+          exit 1
+
+  test:
+    name: Test gate
+    # ── NO `needs: bump`, deliberately ─────────────────────────────────────
+    # `bump` is SKIPPED outright on schedule ticks and bot-actor pushes
+    # (its own `if:` at the top of this file). A job that needs a skipped job
+    # is itself skipped, so `needs: bump` here would skip the gate on every
+    # schedule tick — and `drip`'s scheduled arm would then be blocked by a
+    # SKIP, regressing the exact never-published hole drip exists to close.
+    # Running in parallel with bump also halves wall-clock.
+    #
+    # Consequence to state rather than hide: this verifies the PRE-bump tree,
+    # while `ship` re-checkouts main and publishes the POST-bump tree. Only
+    # version numbers differ between them, so the subject-set gap is real but
+    # narrow.
+    #
+    # STEPS ARE INLINE rather than `uses:` nix-devshell-cargo-test.yml, and
+    # that is load-bearing: this workflow is registered as a FLAT LEAF in
+    # pleme-rust.yml, whose header records that `consumer -> pleme ->
+    # pleme-rust -> leaf` is exactly GitHub's 4-workflow ceiling and legal
+    # ONLY while the leaf nests nothing. Calling a reusable here would make
+    # that chain 5 and the run would not start at all. The steps below also
+    # need two things that reusable cannot express — an injected nextest and
+    # the release-gate fallback — so this is a different job, not a copy.
+    if: inputs.require-tests
+    runs-on: ${{ inputs.runner != '' && inputs.runner || (github.event.repository.private && 'camelot-builder-pleme-eks' || 'ubuntu-latest') }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+        with:
+          github-token: ${{ secrets.BOT_PAT }}
+
+      # Same private-git-dep credential fix as nix-devshell-cargo-test.yml:
+      # nix-installer's github-token covers NIX's fetcher only, never CARGO's
+      # separate git-dependency resolution, and checkout's this-repo-scoped
+      # extraheader silently wins over url.insteadOf by prefix match.
+      - name: Configure git credentials for private git dependencies (cargo)
+        env:
+          GIT_AUTH_TOKEN: ${{ secrets.BOT_PAT }}
+        run: |
+          git config --global url."https://x-access-token:${GIT_AUTH_TOKEN}@github.com/".insteadOf "https://github.com/"
+          git config --unset-all http.https://github.com/.extraheader || true
+
+      # Resolve WHICH shell the tests run in, and at what TIER.
+      #
+      # Measured 2026-08-06 across all 52 consumers of this workflow: only 17
+      # can enter their own devShell. 25 are devenv-backed (`nix develop`
+      # fails pure AND --impure), 7 have no flake, 3 hard-fail otherwise. A
+      # gate that simply used `.#default` would block ~35 repos from
+      # publishing for an ENVIRONMENT defect, not a test failure — and the
+      # reds would be muted within a week.
+      #
+      # So: the consumer's own shell when the preflight says Ok, else
+      # substrate's pinned `release-gate`. The fallback's failure mode is a
+      # missing buildInput — a loud false RED — never a vacuous green, which
+      # is what separates it from the unpinned-toolchain fallback
+      # devshell-preflight.nix explicitly rejects.
+      # The BRANCH lives in lib/util/test-env.nix, next to the
+      # devshell-preflight it branches on. This step redirects stdout and does
+      # nothing else — no `if`, no `grep`, no parsing. That is the property
+      # worth holding; the language is downstream of it.
+      #
+      # It was a ~15-line `run:` with an embedded eval, a `grep -qx` and an
+      # if/else for about an hour, written by the same hand that spent the
+      # session enforcing the no-shell rule — inline shell in a workflow reads
+      # as YAML with a long string in it, so the rule does not fire.
+      - name: Resolve test environment
+        id: env
+        run: >-
+          nix eval --impure --raw --expr
+          'import (builtins.getFlake "github:pleme-io/substrate").testEnvPath {
+             system    = builtins.currentSystem;
+             devshell  = "${{ inputs.test-devshell }}";
+             devShells = (builtins.getFlake (toString ./.)).devShells or {};
+           }' >> "$GITHUB_OUTPUT"
+
+      # nextest comes from substrate's pin as an absolute store path, NOT
+      # from the consumer's devShell — 20 of 52 consumers pin substrate at
+      # 2026-06-07, so anything added to their shell reaches them only after
+      # they re-lock, and a consumer can replace `extraPackages` outright.
+      - name: Fetch the anti-vacuity runner
+        id: nextest
+        run: |
+          out=$(nix build --no-link --print-out-paths github:pleme-io/substrate#cargo-nextest)
+          echo "bin=$out/bin/cargo-nextest" >> "$GITHUB_OUTPUT"
+
+      # `--no-tests=fail` IS the anti-vacuity assertion, and it is a flag on
+      # an existing tool rather than a gate of our own. `cargo test` exits 0
+      # when it runs zero tests — measured on three shapes (no tests at all,
+      # every test #[ignore], a filter matching nothing), all exit 0. nextest
+      # exits 4 on each. Without this flag the gate would happily green a
+      # publish that executed nothing, which is the precise failure it exists
+      # to prevent.
+      - name: Test gate (${{ steps.env.outputs.tier }}, ${{ inputs.test-granularity }} granularity)
+        env:
+          CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+        run: |
+          echo "::notice::test gate tier=${{ steps.env.outputs.tier }} shell=${{ steps.env.outputs.installable }} granularity=${{ inputs.test-granularity }}"
+          nix develop "${{ steps.env.outputs.installable }}" -c \
+            "${{ steps.nextest.outputs.bin }}" nextest run --no-tests=fail ${{ inputs.test-args }}
+
+  ship:
+    name: Ship workspace to registry
+    needs: [bump, test]
+    runs-on: ${{ inputs.runner != '' && inputs.runner || (github.event.repository.private && 'camelot-builder-pleme-eks' || 'ubuntu-latest') }}
+    # privacy posture 2026-07-05: private repos bump+tag only — no public
+    # registry publish; see pangea-architectures PRIVACY-WAVES.md. Publishing
+    # a new version from a private repo leaks code to crates.io and undoes
+    # yanks. Same caller-visibility expression family as the runner routing
+    # above (in a workflow_call the github context is the CALLER's run).
+    # Nothing depends on this job, so a visibility-skip fails nothing downstream.
+    # The test result is asserted EXPLICITLY rather than left to `needs:`.
+    #
+    # CORRECTED 2026-08-12 — the reason previously given here was FALSE. It
+    # claimed a job-level `if:` REPLACES the implicit `success()`. It does not.
+    # GitHub: "A default status check of `success()` is applied unless you
+    # include one of these functions" (success/failure/always/cancelled). This
+    # expression names none of them, so the default `success()` still applies
+    # ON TOP of it. Getting this backwards is easy and consequential: it is the
+    # difference between `always()` (ignores every `needs:` result — never the
+    # right guard here) and `!cancelled() &&` (keeps the explicit assertions
+    # below load-bearing).
+    #
+    # CONSEQUENCE, believed but NOT verified live: because the default
+    # `success()` applies and a skipped dependency does not satisfy it, the
+    # second arm — the `require-tests == false` waiver path — is probably
+    # UNREACHABLE. `needs.test.result == 'skipped'` can only be read by a job
+    # that still runs when `test` skipped, which this one does not. It has
+    # never been exercised either way: 0 of the 52 consumers set
+    # `require-tests`, which is why nothing has surfaced it.
+    #
+    # Do NOT "fix" that by reaching for `always()`; it would drop the
+    # `bumped`/visibility guards with it. Establishing the real behaviour wants
+    # a throwaway-repo experiment, not a reasoned edit to the path every
+    # consumer releases through — a previous attempt to harden this was
+    # reverted for exactly that reason.
+    # pending-release-path: waiver-arm reachability (needs a live experiment)
+    if: >-
+      needs.bump.outputs.bumped == 'true'
+      && !github.event.repository.private
+      && (
+        needs.test.result == 'success'
+        || (inputs.require-tests == false && needs.test.result == 'skipped')
+      )
+    steps:
+      # Re-checkout to pick up the bumped Cargo.toml from main.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+          token: ${{ secrets.BOT_PAT || secrets.GITHUB_TOKEN }}
+
+      # Private git dependencies. checkout's token is scoped to THIS repo, so a
+      # workspace whose members read a sibling PRIVATE pleme-io repo fails with
+      # cargo's misleading "revision <sha> not found" — the fetch is denied, and
+      # cargo reports the resulting empty clone as a missing rev rather than as
+      # auth. escriba tripped exactly this on zenmai (private).
+      #
+      # cargo-auto-release.yml has carried this on bump+ship since the ~20-repo
+      # private flip (2026-07-23); this workspace sibling never got it. Same fix,
+      # same placement: after checkout, before anything cargo touches.
+      - uses: pleme-io/actions/git-credentials@main
+        with:
+          bot-pat: ${{ secrets.BOT_PAT }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: pleme-io/actions/rust-workspace-publish@main
+        with:
+          no-verify: ${{ inputs.no-verify }}
+          rename-prefix: ${{ inputs.rename-prefix }}
+          publish-mode: full
+        env:
+          # Org-level secret name is CRATES_API_TOKEN; cargo reads
+          # CARGO_REGISTRY_TOKEN. Bridge the names here.
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_API_TOKEN }}
+
+  # Drip: a scheduled (cron) tick that publishes only what crates.io
+  # capacity currently allows and defers the rest — the resume engine
+  # that finishes a large new-crate bootstrap hands-off, across the
+  # natural rate-limit refill, until every member is on the registry.
+  # No bump, no tag; idempotent (skips already-published); a no-op in
+  # seconds once the bootstrap converges, so it's safe to leave armed.
+  drip:
+    name: Drip-publish remaining capacity
+    runs-on: ${{ inputs.runner != '' && inputs.runner || (github.event.repository.private && 'camelot-builder-pleme-eks' || 'ubuntu-latest') }}
+    # Three arms, and the third is the one that makes this job trustworthy
+    # rather than opt-in:
+    #
+    #   schedule           — the consumer's */15 auto-drain, and ★ THIS ARM IS
+    #                        DEAD IN ALMOST EVERY CONSUMER. A reusable workflow
+    #                        cannot schedule itself; `on: schedule` has to be
+    #                        declared in the CALLING shim. Measured 2026-08-07
+    #                        across the org: of 434 shims calling
+    #                        cargo-/rust-auto-release, exactly THREE declare it
+    #                        (blue, sui, tatara-rust-ast). The other 431 reach
+    #                        this job only via push or manual dispatch.
+    #
+    #                        That is why the "hands-off across the natural
+    #                        rate-limit refill" promise above is NOT general.
+    #                        Receipt: magma parked `magma-attest` on crates.io
+    #                        new-crate capacity, ten downstream crates deferred
+    #                        behind it, and the run went red saying "circular
+    #                        dep or stuck registry index" — a cause that was
+    #                        false twice over. Nothing retried, because for
+    #                        magma there was no next tick. It took an operator
+    #                        dispatch.
+    #
+    #                        DO NOT "fix" this by arming all 431. 431 repos x
+    #                        4/hr is ~41k runs/day of near-total no-ops, all
+    #                        drawing on the SAME 5000/hr GitHub bucket the
+    #                        org-posture operator already exhausts on its own.
+    #                        The cure would be worse than the disease. Arm the
+    #                        few repos doing a genuine multi-crate bootstrap
+    #                        (that is what blue/sui/tatara-rust-ast are), and
+    #                        for the general case prefer ONE central catch-up
+    #                        that reads the crates.io sparse index — free, no
+    #                        GitHub API — and dispatches only repos actually
+    #                        behind: O(behind) instead of O(all).
+    #   workflow_dispatch  — operator-forced "publish what's missing now",
+    #                        the resume hand-off for a backlog a cancelled or
+    #                        deferred ship stranded, with no fake source
+    #                        change needed to re-trigger the ship path
+    #   push where bump did NOT bump — ship's complement
+    #
+    # The third arm was added 2026-07-30 and reverses this comment's previous
+    # claim that "a plain `push` still never drips (push bumps+ships fresh
+    # source instead)". That is true only when ship RUNS. When the
+    # skip-detector finds no source change, ship is skipped, NOTHING asserts
+    # anything about the registry, and the run reports success — the same
+    # green-by-omission cargo-auto-release's drip was built to remove.
+    #
+    # Measured 2026-07-30 across 204 publishing members in public repos: 61
+    # were never published and 2 were behind, with no red anywhere. `ishou`
+    # is the clean instance — it calls this reusable, carries NO schedule, so
+    # its drip had never once run, and ishou-batente/ishou-pente@0.1.4 are
+    # both absent from crates.io. Requiring each consumer to remember a cron
+    # is what let that sit. `tear` DOES carry the */15 schedule and its
+    # members are still absent, so this arm is necessary, not sufficient —
+    # that case is a separate, still-open defect.
+    #
+    # Safe to run on the complement: rust-workspace-publish is idempotent
+    # (already-published is an explicit green) and converges to a no-op in
+    # seconds. `needs: bump` + always() keeps the schedule arm alive even
+    # though bump itself skips on schedule.
+    #
+    # privacy posture 2026-07-05: private repos bump+tag only — no public
+    # registry publish; see pangea-architectures PRIVACY-WAVES.md. Documented
+    # residual (same as the runner-routing edge above): schedule-triggered
+    # callers may lack github.event.repository, so `!…private` falls open —
+    # private repos should not carry a drip schedule in the first place.
+    needs: [bump, test]
+    # `always()` is load-bearing for the schedule arm (bump is skipped there),
+    # but it is ALSO why `needs: test` alone would have closed nothing: an
+    # `if:` opening with `always()` ignores every needs RESULT by definition,
+    # so a FAILED test job would still have let this publish to crates.io.
+    # The test result therefore has to be asserted as its own clause.
+    #
+    # On the schedule/dispatch arms the gate still applies: `test` has no
+    # `needs: bump`, so it runs on those triggers too and this condition is
+    # satisfied by a real pass, not by a skip.
+    if: >-
+      always()
+      && !github.event.repository.private
+      && (
+        needs.test.result == 'success'
+        || (inputs.require-tests == false && needs.test.result == 'skipped')
+      )
+      && (
+        github.event_name == 'schedule'
+        || github.event_name == 'workflow_dispatch'
+        || (needs.bump.result == 'success' && needs.bump.outputs.bumped != 'true')
+      )
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+          token: ${{ secrets.BOT_PAT || secrets.GITHUB_TOKEN }}
+
+      # Private git dependencies. checkout's token is scoped to THIS repo, so a
+      # workspace whose members read a sibling PRIVATE pleme-io repo fails with
+      # cargo's misleading "revision <sha> not found" — the fetch is denied, and
+      # cargo reports the resulting empty clone as a missing rev rather than as
+      # auth. escriba tripped exactly this on zenmai (private).
+      #
+      # cargo-auto-release.yml has carried this on bump+ship since the ~20-repo
+      # private flip (2026-07-23); this workspace sibling never got it. Same fix,
+      # same placement: after checkout, before anything cargo touches.
+      - uses: pleme-io/actions/git-credentials@main
+        with:
+          bot-pat: ${{ secrets.BOT_PAT }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: pleme-io/actions/rust-workspace-publish@main
+        with:
+          no-verify: ${{ inputs.no-verify }}
+          rename-prefix: ${{ inputs.rename-prefix }}
+          publish-mode: drip
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_API_TOKEN }}

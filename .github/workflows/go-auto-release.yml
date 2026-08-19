@@ -1,0 +1,399 @@
+name: go-auto-release
+
+# Reusable workflow: the Go MODULE delivery FSM (FSM-MODULE) rendered as
+# CI. Pull-model, tag-only — the ONLY publish side effect is
+# `git push origin <tag>`; proxy.golang.org fetches lazily on first
+# `go get`, so the "publish" step is a NO-OP confirmation, not an upload
+# (contrast cargo publish / npm publish). This is the FSM statement of
+# LAYOUT-05 / VER-12 from docs/go/go-software-delivery-standard.md.
+#
+# The delivery-FSM states ARE the workflow stages — one stage per state:
+#
+#   Drafted (start)
+#     └─ Validate (ValidationGate) ────────────────────────► Validated
+#          • clean working tree + HEAD == remote tip
+#          • go vet ./...   (vet_green)
+#          • go test ./...  (test_green)
+#          • go build ./... (build_green)
+#          • go mod tidy leaves go.sum unchanged (tidy check)
+#          • /vN suffix coherence for major ≥ 2 (honored via /vN bump)
+#     └─ Tag (TagGate, monotonic semver) ──────────────────► Tagged
+#          • relver computes strictly-greater vMAJOR.MINOR.PATCH
+#          • annotated tag + push (TAG-PUSH-IS-CAS via relver idempotency)
+#     └─ Proxied (ConfirmProxy / ProxyAvailableGate) ──────► Proxied
+#          • publish is a NO-OP — confirm proxy.golang.org indexed it
+#     └─ Verify (VerifyGate) ──────────────────────────────► Verified (terminal-ok)
+#          • hermetic `go install`/`go get` resolves the exact version
+#
+# Mirrors cargo-auto-release.yml / rust-auto-release.yml structure
+# (bot-identity, drift handling, skip-when-bot-pushed) but swaps the
+# upload `ship` job for a pull-model `proxy-confirm` + `verify` pair.
+#
+# Consumer (.github/workflows/auto-release.yml):
+#
+#   on: { push: { branches: [main] } }
+#   jobs:
+#     release:
+#       uses: pleme-io/substrate/.github/workflows/go-auto-release.yml@main
+#       secrets: inherit
+#
+# Tag engine: relver (substrate#relver) — the typed semver / changed-since-tag
+# / idempotent-tag primitive. NO bash semver math.
+
+on:
+  workflow_call:
+    inputs:
+      bump-type:
+        description: "patch | minor | major"
+        type: string
+        required: false
+        default: patch
+      module-path:
+        description: "Subdirectory containing go.mod (root by default; set for a submodule)."
+        type: string
+        required: false
+        default: "."
+      changed-globs:
+        description: "Space-separated globs relver inspects for changes since the last tag — only bump when Go source moved."
+        type: string
+        required: false
+        default: "**/*.go go.mod go.sum"
+      tag-glob:
+        description: "Glob relver uses to discover the last tag. Override to vN.* once the module crosses a major (honor /vN)."
+        type: string
+        required: false
+        default: "v0.*"
+      go-version:
+        description: "Go toolchain version for vet/test/build."
+        type: string
+        required: false
+        default: "stable"
+      proxy-poll-attempts:
+        description: "ConfirmProxy poll budget (VER-16 typed deadline). Exhaustion = ProxyTimedOut, not a hard fail."
+        type: string
+        required: false
+        default: "20"
+      # ── THE RISK HERE IS CONSISTENCY, NOT DISCLOSURE. Say it plainly. ──
+      #
+      # Six workflows in this family (cargo, crossplane-function,
+      # helm-monorepo, nix-image, rust, rust-binary) guard publishing from a
+      # private repo because a registry UPLOAD ships source to a public host
+      # and cannot be withdrawn, only yanked. Go is not that shape, and
+      # pretending otherwise would overstate the risk:
+      #
+      #   • Nothing is uploaded, ever. Go's entire publish side effect is
+      #     `git push origin <tag>` in the `tag` job — to the repo's OWN
+      #     remote. The pull model has no upload step to guard.
+      #   • proxy.golang.org CANNOT FETCH A PRIVATE MODULE. It has no
+      #     credentials for the repo, so the ConfirmProxy poll 404s until its
+      #     budget exhausts (ProxyTimedOut, a defined in-FSM outcome). No
+      #     source can reach the proxy even with the guard removed.
+      #   • What the unguarded path DOES disclose is metadata, not source:
+      #     the `go list -m` prime and the poll URL send the module path
+      #     (i.e. the private repo's org/name) and the version string to a
+      #     public Google-run service. Real, small, and worth naming — but it
+      #     is not the source-leak the sibling guards exist for.
+      #
+      # So this input is here for ONE-SHAPE-ACROSS-THE-FAMILY, so that
+      # "does this workflow guard private publishing?" has the same answer and
+      # the same knob everywhere, and so a reader never has to re-derive Go's
+      # exemption from first principles. The guard withholds the
+      # public-proxy confirm + verify pair; bump and tag are untouched.
+      publish-from-private:
+        description: >-
+          Publish even though the repository is private. Default false: a private
+          repo publishing to a public registry ships its source there, and a
+          registry publish cannot be withdrawn, only yanked. Set true only where
+          a private source deliberately produces a public artifact.
+        type: string
+        required: false
+        default: "false"
+      # Runner routing: empty default routes by CALLER repo visibility —
+      # private repos → the org-scoped camelot-builder-pleme-eks ARC pool (avoids billed
+      # hosted minutes; org runner groups refuse public repos anyway), public
+      # repos → ubuntu-latest. Schedule-triggered callers may lack
+      # github.event.repository and fall open to hosted (documented edge).
+      # Do NOT put an expression in this default — workflow_call input
+      # defaults are static; the fallback lives in each job's runs-on.
+      runner:
+        description: "Explicit runner label override; empty = route by caller repo visibility (private → camelot-builder-pleme-eks, public → ubuntu-latest)."
+        type: string
+        required: false
+        default: ""
+    secrets:
+      BOT_PAT:
+        required: false
+        description: "Optional PAT with repo scope so the tag push triggers downstream workflows."
+
+permissions:
+  contents: write
+
+# Single-writer / CAS publish (FSM-CAS): serialize the FSM per ref so two
+# concurrent runs can't race the tag push.
+concurrency:
+  group: go-auto-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ── Drafted → Validated ─────────────────────────────────────────────
+  # ValidationGate: pure over a captured snapshot — go vet / test / build,
+  # go.sum tidy check, clean tree. No tagging side effects here.
+  validate:
+    name: 'go · Drafted→Validated (ValidationGate)'
+    runs-on: ${{ inputs.runner != '' && inputs.runner || (github.event.repository.private && 'camelot-builder-pleme-eks' || 'ubuntu-latest') }}
+    # Skip when the bot itself pushed (avoids tag-push → bump → tag-push loops).
+    if: github.actor != 'github-actions[bot]'
+    defaults:
+      run:
+        working-directory: ${{ inputs.module-path }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.BOT_PAT || secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ inputs.go-version }}
+          cache-dependency-path: ${{ inputs.module-path }}/go.sum
+
+      # ValidationGate(d): go vet ./... exit 0
+      - name: vet (vet_green)
+        run: go vet ./...
+
+      # ValidationGate(e): go test ./... exit 0
+      - name: test (test_green)
+        run: go test ./...
+
+      # ValidationGate(f): go build ./... exit 0 (mkGoLibraryCheck shape)
+      - name: build (build_green)
+        run: go build ./...
+
+      # go.sum tidy check — `go mod tidy` must be a no-op on a Validated
+      # snapshot, else the committed go.sum drifted from go.mod.
+      - name: go.sum tidy check
+        run: |
+          go mod tidy
+          if ! git diff --quiet -- go.mod go.sum; then
+            echo "::error::go.mod/go.sum are not tidy — run \`go mod tidy\` and commit the result"
+            git --no-pager diff -- go.mod go.sum | head -100
+            exit 1
+          fi
+
+  # ── Validated → Tagged → Proxied ────────────────────────────────────
+  # TagGate via relver: compute a strictly-greater semver tag (gated on
+  # changed Go source), annotate, and push. The push IS the CAS publish
+  # (PULL-MODEL / NO-UPLOAD) — relver's tag create+push is idempotent so a
+  # re-run is a resume, never a duplicate (FSM-IDEMPOTENT / TAG-PUSH-IS-CAS).
+  tag:
+    name: 'go · Validated→Tagged→Proxied (TagGate + relver)'
+    needs: validate
+    runs-on: ${{ inputs.runner != '' && inputs.runner || (github.event.repository.private && 'camelot-builder-pleme-eks' || 'ubuntu-latest') }}
+    outputs:
+      tag: ${{ steps.relver.outputs.tag }}
+      created: ${{ steps.relver.outputs.created }}
+      skip: ${{ steps.relver.outputs.skip }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.BOT_PAT || secrets.GITHUB_TOKEN }}
+
+      # relver is invoked via `nix run` (below) — the runner needs nix.
+      - uses: DeterminateSystems/nix-installer-action@main
+        with:
+          github-token: ${{ secrets.BOT_PAT }}
+
+      # relver next = (changed-since-tag)+(compute-next)+(idempotent tag+push).
+      # gen-spec-bot-style bot identity (matches git-commit-tag default).
+      # `skip=true` when no Go source moved since the last tag — a no-op run.
+      - name: relver next (TagGate → push)
+        id: relver
+        run: |
+          nix run github:pleme-io/substrate#relver -- \
+            --repo "${{ inputs.module-path }}" \
+            next \
+            --bump "${{ inputs.bump-type }}" \
+            --tag-glob "${{ inputs.tag-glob }}" \
+            --changed-globs "${{ inputs.changed-globs }}" \
+            --create-tag \
+            --push \
+            --tag-message-template "release: {tag}" \
+            --identity-name "github-actions[bot]" \
+            --identity-email "41898282+github-actions[bot]@users.noreply.github.com"
+
+  # ── Proxied → Verified ──────────────────────────────────────────────
+  # ProxyAvailableGate (ConfirmProxy poll-loop) + VerifyGate. Go's
+  # pull-model means there is NOTHING to upload: this job CONFIRMS the
+  # tag was indexed by proxy.golang.org, then verifies an external
+  # `go get @<version>` resolves the exact version (VERIFY-CLOSES-LOOP).
+  proxy-confirm:
+    name: 'go · Proxied→Verified (NO-UPLOAD confirm + VerifyGate)'
+    needs: tag
+    runs-on: ${{ inputs.runner != '' && inputs.runner || (github.event.repository.private && 'camelot-builder-pleme-eks' || 'ubuntu-latest') }}
+    # Only when a fresh tag was actually created (changed source + push).
+    #
+    # The private guard carries its own escape hatch, and its skip is ANNOUNCED
+    # by `publish-withheld` below. A bare `&& !private` here would be the exact
+    # defect this change exists to remove: on 2026-08-08 graphql-synthesizer ran
+    # cargo-auto-release, reported SUCCESS, bumped + tagged + pushed, and
+    # published nothing, because a correct guard skipped its ship job and
+    # nothing said so. A guard that fires must state that it fired.
+    #
+    # Scope, stated honestly (see the publish-from-private input above): this
+    # withholds the public-proxy confirm + verify pair, NOT the release. In the
+    # pull model the tag push in `tag` already happened and IS the publish, so
+    # the guard buys consistency with the family, not containment.
+    if: >-
+      needs.tag.outputs.created == 'true'
+      && needs.tag.outputs.skip != 'true'
+      && (!github.event.repository.private || inputs.publish-from-private == 'true')
+    defaults:
+      run:
+        working-directory: ${{ inputs.module-path }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ inputs.go-version }}
+
+      # Resolve the module path from go.mod (escaped per the proxy spec).
+      - name: Resolve module path
+        id: mod
+        run: |
+          MODULE="$(go list -m)"
+          VERSION="${{ needs.tag.outputs.tag }}"
+          echo "module=${MODULE}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      # ConfirmProxy poll-loop (ProxyAvailableGate). The proxy fetches
+      # lazily — a primed `go get` triggers indexing; we then poll the
+      # @v/<version>.info endpoint until 200 OR the typed poll budget is
+      # exhausted (PROXY-TIMEOUT-IN-FSM — exhaustion is a defined outcome,
+      # not a hard fail). NO UPLOAD happens here.
+      - name: ConfirmProxy (publish is a NO-OP — confirm only)
+        env:
+          GOPROXY: https://proxy.golang.org
+          GOSUMDB: sum.golang.org
+        run: |
+          MODULE='${{ steps.mod.outputs.module }}'
+          VERSION='${{ steps.mod.outputs.version }}'
+          ATTEMPTS='${{ inputs.proxy-poll-attempts }}'
+          # Escape the module path for the proxy URL (uppercase → !lower).
+          ESCAPED="$(printf '%s' "$MODULE" | sed -E 's/([A-Z])/!\L\1/g')"
+          URL="https://proxy.golang.org/${ESCAPED}/@v/${VERSION}.info"
+          echo "confirming (no upload) ${MODULE}@${VERSION} via ${URL}"
+          # Prime lazy indexing — pull-model trigger, not a push.
+          go list -m "${MODULE}@${VERSION}" >/dev/null 2>&1 || true
+          n=0
+          until [ "$n" -ge "$ATTEMPTS" ]; do
+            code="$(curl -s -o /dev/null -w '%{http_code}' "$URL" || echo 000)"
+            if [ "$code" = "200" ]; then
+              echo "proxy indexed ${MODULE}@${VERSION} (Proxied → confirmed)"
+              exit 0
+            fi
+            n=$((n+1))
+            echo "poll ${n}/${ATTEMPTS}: ${code} — proxy not yet indexed; waiting"
+            sleep 15
+          done
+          # poll_budget_exhausted → ProxyTimedOut (in-FSM, recoverable).
+          echo "::warning::ConfirmProxy poll budget exhausted (ProxyTimedOut) — proxy will index lazily on first \`go get\`; tag is pushed and immutable"
+
+      # VerifyGate: hermetic external resolve. Verified is reached only
+      # when an outside consumer can `go get @<version>` and get the exact
+      # version back (CHECKSUM-DB-VERIFIED via GOSUMDB=sum.golang.org).
+      - name: Verify (VerifyGate → Verified)
+        env:
+          GOPROXY: https://proxy.golang.org
+          GOSUMDB: sum.golang.org
+        run: |
+          MODULE='${{ steps.mod.outputs.module }}'
+          VERSION='${{ steps.mod.outputs.version }}'
+          tmp="$(mktemp -d)"
+          cd "$tmp"
+          go mod init verify.local/probe >/dev/null
+          if go get "${MODULE}@${VERSION}"; then
+            resolved="$(go list -m "${MODULE}@${VERSION}" 2>/dev/null | awk '{print $2}')"
+            if [ "$resolved" = "$VERSION" ]; then
+              echo "VerifyGate Pass: ${MODULE} resolves to ${VERSION} (Verified)"
+            else
+              echo "::warning::resolved '${resolved}' != intended '${VERSION}' — proxy still propagating (retryable; not a hard fail)"
+            fi
+          else
+            # Indeterminate (couldn't measure) routes to retryable, never a
+            # hard terminal (FSM-TRISTATE).
+            echo "::warning::go get could not yet resolve ${MODULE}@${VERSION} — proxy propagating (Indeterminate, retryable)"
+          fi
+
+  # ── Proxied → (withheld) ────────────────────────────────────────────
+  # The complement of proxy-confirm: it runs PRECISELY when the private guard
+  # withholds, so the skip is a visible statement instead of an absence. Same
+  # shape as cargo-auto-release's "Registry catch-up (seals the skipped-ship
+  # green)" job.
+  publish-withheld:
+    name: 'publish withheld (private repo)'
+    needs: tag
+    # `always()` lifts this job out of the default rule that a job needing a
+    # SKIPPED job is itself skipped — which is what keeps a withheld-notice from
+    # falling back into the silence it exists to break. It is load-bearing in
+    # the family shape (see npm-auto-release / cargo-auto-release's drip, where
+    # the guarded job's precondition does NOT read the skipping job's outputs).
+    #
+    # TIER-HONEST, measured 2026-08-17 by red-run: in THIS workflow the case
+    # table cannot currently detect its removal — deleting always() leaves all
+    # 7 rows green. The reason is structural, not a gap in the table: this job
+    # needs only `tag`, and its positive precondition reads `tag`'s OUTPUTS,
+    # which are empty exactly when `tag` did not run. So every context where
+    # needs-propagation would have skipped it also falsifies its condition, and
+    # no reachable context distinguishes the two. Keep always() anyway — it is
+    # correct, it matches the family, and it becomes genuinely load-bearing the
+    # moment `needs` gains a second member that can skip independently. Just do
+    # not read the green table as proof that it is doing work today.
+    #
+    # The rest is the exact complement of proxy-confirm's condition: the SAME
+    # positive precondition (both conjuncts — a fresh tag was really created and
+    # relver did not report a skip), then private AND no opt-in. proxy-confirm
+    # and this job therefore partition the fresh-tag case — never both, never
+    # neither. Carrying both conjuncts is what keeps the notice off the no-op
+    # runs (no source changed, tag already exists, bot pushed); a notice that
+    # fires when nothing was ever going to publish is noise, and noise gets
+    # ignored, which reintroduces exactly the silence being fixed.
+    if: >-
+      always()
+      && needs.tag.outputs.created == 'true'
+      && needs.tag.outputs.skip != 'true'
+      && github.event.repository.private
+      && inputs.publish-from-private != 'true'
+    runs-on: ${{ inputs.runner != '' && inputs.runner || (github.event.repository.private && 'camelot-builder-pleme-eks' || 'ubuntu-latest') }}
+    permissions:
+      contents: read
+    steps:
+      # Summary through the typed action; only the one-line ::notice stays
+      # inline. step-summary-publish was a STUB when this job was written (a
+      # ::warning and exit 0, writing nothing) — implemented first, because
+      # converting to it beforehand would have deleted this notice silently.
+      - uses: pleme-io/actions/step-summary-publish@main
+        with:
+          template: |
+            ### Publish withheld
+
+            Repository is private; the ConfirmProxy + VerifyGate pair did not
+            run against {{registry}}.
+            Bump and tag still happened — and Go's only publish side effect is
+            that tag push, so the module IS released to anyone who can read the
+            repo.
+
+            Nothing leaked: {{registry}} has no credentials for a private
+            module and could not have fetched it either way. This guard buys
+            consistency with the rest of the release family, not containment.
+
+            If this repo is meant to publish, set `publish-from-private: true`.
+          vars: '{"registry":"proxy.golang.org"}'
+      # Block scalar: the message contains ": " and a plain YAML scalar would
+      # parse as a mapping. Still one line of shell.
+      - shell: bash
+        run: |
+          echo "::notice title=Publish withheld::This repository is private, so the Go module was NOT confirmed or verified against proxy.golang.org. The version was bumped and tagged, and in Go's pull model that tag push IS the release. Set publish-from-private: true if this repo is meant to publish a public artifact from private source."

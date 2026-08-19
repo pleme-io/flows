@@ -1,0 +1,49 @@
+# substrate-parity — the interim duplication is watched, not trusted.
+#
+# This repo is the home of the fleet's reusable workflow_call catalog, but every
+# consumer still resolves the copy in pleme-io/substrate (see README §Status).
+# Two trees, one truth: this job fails if they diverge in either direction — a
+# file edited here and not there, or a workflow_call flow added there and never
+# mirrored here.
+#
+# Delete this workflow together with tools/substrate-parity.tlisp at cutover.
+#
+# It carries no `run:` block on purpose. This repo is the reference
+# implementation of the ethic it distributes: a workflow is a call with values,
+# and the comparison lives in a .tlisp an operator can run offline.
+
+name: substrate-parity
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Daily, because drift here is introduced by a commit in ANOTHER repo and
+    # would otherwise wait for the next push to this one to be noticed.
+    - cron: '0 7 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  parity:
+    # Public repo, so GitHub-hosted minutes are free — never a metered label.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check out substrate's workflow tree
+        uses: actions/checkout@v4
+        with:
+          repository: pleme-io/substrate
+          path: substrate
+          sparse-checkout: .github/workflows
+          sparse-checkout-cone-mode: false
+
+      - name: Compare every flow against substrate
+        uses: pleme-io/actions/tatara-script@main
+        with:
+          script-file: tools/substrate-parity.tlisp

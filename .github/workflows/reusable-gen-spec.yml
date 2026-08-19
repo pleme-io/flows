@@ -1,0 +1,97 @@
+# reusable-gen-spec — Cargo.gen.lock + build-spec maintenance, for 417 callers.
+#
+# A thin caller of `reusable-autoheal.yml`. The skeleton this file used to carry
+# by hand — checkout, credentials, nix, detect, regenerate, fail-the-PR, push
+# back — is the AUTOHEAL quality and now lives in exactly one place. Read that
+# file's header for the receipts; the short version is that fourteen workflows
+# carried this shape and each re-decided the runner, eight onto a pool that had
+# stalled, which killed autoheal on every private repo in the fleet.
+#
+# ── THE INTERFACE IS UNCHANGED. Callers do not move. ────────────────────────
+# Same name, same two inputs, same defaults. A Rust repo still adopts it with:
+#
+#   # .github/workflows/gen-spec.yml
+#   name: gen-spec
+#   on:
+#     push: { branches: [main], paths: ["**/Cargo.toml", "**/Cargo.lock"] }
+#     pull_request: { paths: ["**/Cargo.toml", "**/Cargo.lock"] }
+#   jobs:
+#     gen-spec:
+#       uses: pleme-io/substrate/.github/workflows/reusable-gen-spec.yml@main
+#       secrets: inherit
+#
+# ── WHAT MATERIALLY CHANGES FOR CALLERS ─────────────────────────────────────
+# 1. THE RUNNER. Jobs no longer route by repo visibility. Private repos ran on
+#    camelot-builder-pleme-eks, which is stalled — measured 2026-08-06, 284 of
+#    the 412 repos carrying a Cargo.gen.lock are private, so 69% of the gated
+#    fleet had no working autoheal at all. Everything now runs on ubuntu-latest
+#    unless a caller passes `runner`.
+#
+#    This costs billed minutes on private repos, which is exactly what the old
+#    routing existed to avoid, so it was measured before being chosen: 243
+#    gen-spec runs/month across the private delta repos at ~4 min each ≈ 970
+#    min against GitHub Free's 2000 private-repo minutes.
+#
+# 2. A workflow_dispatch can no longer fake-green. It previously matched
+#    neither the push arm nor the pull_request arm, so every step skipped and
+#    the job reported SUCCESS having done nothing — a manual re-run of a
+#    genuinely stale repo looked fixed. Unhandled events now fail.
+#
+# ── PROVEN BEFORE THIS FILE WAS TOUCHED ─────────────────────────────────────
+# Piloted on amimori (private, previously two consecutive failures on the
+# camelot pool): the run went in_progress in seconds, detect passed, repair
+# committed, and push-back succeeded — and because that repo carried a v1
+# delta, the heal also migrated it to v2 with manifest_sha256. Full chain, on
+# the exact class of repo this migration is meant to rescue.
+#
+# A first pilot on arch-synthesizer failed and was NOT the workflow: that repo
+# has 17 sibling `path = "../…"` dependencies, so `cargo metadata` cannot
+# resolve there in CI under any workflow. 45 of 412 delta repos (11%) share
+# that shape and need their own answer — this migration does not fix them and
+# does not claim to.
+#
+# ── SEMANTICS PRESERVED EXACTLY ─────────────────────────────────────────────
+# `detect` is plain `gen confirm` (strict), as before — NOT `--if-present`.
+# Refactor and behaviour change do not belong in one commit. Note the
+# consequence, unchanged from before: on a v1 delta `confirm` reports
+# untied-manifests and exits non-zero, which is advisory on a push (so the
+# repair still runs and migrates it) and fatal on a PR.
+#
+# The PR arm diffs only Cargo.gen.lock: Cargo.build-spec.json is gitignored
+# under the delta-only doctrine, so it never registers as a tracked diff.
+name: reusable-gen-spec
+
+on:
+  workflow_call:
+    inputs:
+      gen-ref:
+        description: "gen flake ref to run (pin for reproducibility)."
+        type: string
+        default: "github:pleme-io/gen"
+      runner:
+        description: "Runner override. Empty uses the shared default (ubuntu-latest)."
+        type: string
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  gen-spec:
+    # Fully-qualified, not `./…`: this workflow is itself called from another
+    # repo, and a relative path resolves against the CALLER's checkout, which
+    # is not substrate. Matches the fleet's 109 other nested calls.
+    uses: pleme-io/substrate/.github/workflows/reusable-autoheal.yml@main
+    secrets: inherit
+    with:
+      artifact: "Cargo.gen.lock"
+      paths: "Cargo.gen.lock"
+      detect: "nix run ${{ inputs.gen-ref }} -- confirm"
+      repair: "nix run ${{ inputs.gen-ref }} -- build . --commit"
+      regen: "nix run ${{ inputs.gen-ref }} -- build ."
+      fix-hint: "gen build . && git commit Cargo.lock Cargo.gen.lock"
+      # ubuntu-latest ships neither. `gen build` shells to `cargo metadata`,
+      # which shells to `rustc -vV`; the old inline `nix shell` wrapper is now
+      # this typed input.
+      toolchain: "nixpkgs#cargo nixpkgs#rustc"
+      runner: ${{ inputs.runner }}

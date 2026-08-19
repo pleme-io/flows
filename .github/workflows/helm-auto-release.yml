@@ -1,0 +1,177 @@
+name: helm-auto-release
+
+# Reusable workflow: on push to main, bump a Helm chart's
+# version, commit, tag, push, helm-package + push to OCI registry.
+
+on:
+  workflow_call:
+    inputs:
+      bump-type:
+        type: string
+        required: false
+        default: patch
+      registry:
+        type: string
+        required: false
+        default: "ghcr.io/pleme-io/helm"
+      # Directory holding the chart's Chart.yaml, relative to the repo root.
+      #
+      # Until 2026-08-10 this workflow had no such input because helm-bump and
+      # helm-publish both read `Chart.yaml` from the process CWD — i.e. they
+      # assumed the chart sat at the REPO ROOT. Measured that day: of the 18
+      # pleme-io repos that ship Helm charts, the number with a root
+      # `Chart.yaml` is ZERO. Every one uses `charts/<name>/`. So this
+      # workflow's single-chart path could not serve any repo in the fleet,
+      # and the first repo to adopt it (ensaio) failed on its first run with
+      # `helm-bump: no Chart.yaml at repo root` — its chart stayed two
+      # versions behind source with nothing red.
+      chart-path:
+        description: "Directory holding Chart.yaml, relative to the repo root. '.' = repo root."
+        type: string
+        required: false
+        default: "."
+      # NOTE: resolved relative to `chart-path`, because that is the CWD the
+      # skip-detector's `git diff` runs in. Do NOT repeat the chart-path
+      # prefix here — the default below is already correct for a chart in a
+      # subdirectory. helm-bump fails loudly when none of these paths exists,
+      # so getting it wrong is a red run rather than a green no-op.
+      source-paths:
+        type: string
+        required: false
+        default: "templates values.yaml Chart.yaml"
+      # Unlike source-paths, these are repo-root-relative: git-commit-tag runs
+      # in the bump job's own CWD (the repo root), not inside the chart.
+      add-paths:
+        type: string
+        required: false
+        default: "Chart.yaml"
+      # Runner routing: empty default routes by CALLER repo visibility —
+      # private repos → the org-scoped camelot-builder-pleme-eks ARC pool (avoids billed
+      # hosted minutes; org runner groups refuse public repos anyway), public
+      # repos → ubuntu-latest. Schedule-triggered callers may lack
+      # github.event.repository and fall open to hosted (documented edge).
+      # Do NOT put an expression in this default — workflow_call input
+      # defaults are static; the fallback lives in each job's runs-on.
+      runner:
+        description: "Explicit runner label override; empty = route by caller repo visibility (private → camelot-builder-pleme-eks, public → ubuntu-latest)."
+        type: string
+        required: false
+        default: ""
+    secrets:
+      BOT_PAT:
+        required: false
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  bump:
+    runs-on: ${{ inputs.runner != '' && inputs.runner || (github.event.repository.private && 'camelot-builder-pleme-eks' || 'ubuntu-latest') }}
+    if: github.actor != 'github-actions[bot]'
+    outputs:
+      bumped: ${{ steps.bump.outputs.bumped }}
+      new-version: ${{ steps.bump.outputs.new-version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.BOT_PAT || secrets.GITHUB_TOKEN }}
+
+      - id: bump
+        uses: pleme-io/actions/helm-bump@main
+        with:
+          bump-type: ${{ inputs.bump-type }}
+          source-paths: ${{ inputs.source-paths }}
+          chart-path: ${{ inputs.chart-path }}
+
+      - if: steps.bump.outputs.bumped == 'true'
+        uses: pleme-io/actions/git-commit-tag@main
+        with:
+          version: ${{ steps.bump.outputs.new-version }}
+          add-paths: ${{ inputs.add-paths }}
+
+      - if: steps.bump.outputs.bumped == 'true'
+        uses: pleme-io/actions/git-push-with-token@main
+        with:
+          token: ${{ secrets.BOT_PAT || secrets.GITHUB_TOKEN }}
+          branch: main
+          push-tags: "true"
+
+  ship:
+    needs: bump
+    runs-on: ${{ inputs.runner != '' && inputs.runner || (github.event.repository.private && 'camelot-builder-pleme-eks' || 'ubuntu-latest') }}
+    if: needs.bump.outputs.bumped == 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+          token: ${{ secrets.BOT_PAT || secrets.GITHUB_TOKEN }}
+
+      - uses: pleme-io/actions/helm-publish@main
+        with:
+          registry: ${{ inputs.registry }}
+          chart-path: ${{ inputs.chart-path }}
+        env:
+          # ghcr.io accepts GITHUB_TOKEN as the OCI registry password
+          GHCR_TOKEN: ${{ secrets.BOT_PAT || secrets.GITHUB_TOKEN }}
+
+      # ── VERIFY THE ARTIFACT, NEVER THE EXIT CODE ──────────────────────────
+      #
+      # A publish step that exits 0 is not evidence a consumer can resolve the
+      # chart. Measured 2026-08-10 in pleme-io/ensaio: chart source sat at
+      # 0.1.4 while the registry held 0.1.2 and the cluster ran 0.1.2, with the
+      # HelmRelease reporting "Helm upgrade succeeded" on every reconcile. Four
+      # RBAC commits were unreachable — including the grant an ephemeral-
+      # environment qualification depends on — and nothing anywhere was red.
+      #
+      # That instance was a MISSING workflow, which this job cannot catch (see
+      # the note below). What it does catch is every way a PRESENT one still
+      # ships nothing:
+      #   - published to a registry no consumer reads (the reusable's default
+      #     differs from what several charts are actually consumed from, so
+      #     this is a live footgun, not a hypothetical),
+      #   - a push that reported success and stored nothing,
+      #   - a version skipped so consumers pin a tag that never existed.
+      #
+      # It re-reads Chart.yaml from the tree AFTER the bump commit, so it
+      # verifies the version that was actually shipped rather than the one the
+      # job started with.
+      - name: verify the published chart is resolvable
+        shell: bash
+        env:
+          GHCR_TOKEN: ${{ secrets.BOT_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Read the SAME Chart.yaml the bump and publish steps operated on.
+          # The previous form globbed for one (`git ls-files '*/Chart.yaml'
+          # 'Chart.yaml' | head -1`) which silently picks an arbitrary chart
+          # in a repo that has more than one — it would then verify a chart
+          # nobody published and pass. `chart-path` names it exactly.
+          chart_yaml="${{ inputs.chart-path }}/Chart.yaml"
+          if [ ! -f "$chart_yaml" ]; then
+            echo "::error::no Chart.yaml at '${chart_yaml}' — chart-path is wrong, and this"
+            echo "::error::verification would otherwise have nothing to check and pass."
+            exit 1
+          fi
+          name="$(awk '/^name:/{print $2; exit}' "$chart_yaml")"
+          version="$(awk '/^version:/{print $2; exit}' "$chart_yaml")"
+          if [ -z "$name" ] || [ -z "$version" ]; then
+            echo "::error::could not read name/version from ${chart_yaml} (got name='${name}' version='${version}')."
+            echo "::error::An empty version makes the resolvability check below vacuous."
+            exit 1
+          fi
+          ref="oci://${{ inputs.registry }}/${name}"
+          echo "verifying ${ref} --version ${version}"
+          echo "$GHCR_TOKEN" | helm registry login ghcr.io -u "${{ github.actor }}" --password-stdin
+          if ! helm show chart "$ref" --version "$version" >/dev/null 2>&1; then
+            echo "::error::PUBLISH REPORTED SUCCESS BUT THE CHART IS NOT RESOLVABLE."
+            echo "::error::  ${ref} --version ${version}"
+            echo "::error::A consumer pinning this version gets the LAST published one and"
+            echo "::error::reports a green 'Helm upgrade succeeded' while running stale"
+            echo "::error::templates. Check that 'registry' matches the HelmRepository the"
+            echo "::error::cluster actually reads."
+            exit 1
+          fi
+          echo "resolvable: ${ref} --version ${version}"

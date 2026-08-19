@@ -1,0 +1,40 @@
+# Ansible collection auto-merge -- reusable composite workflow (Layer 2).
+#
+# Composes:
+#   - peter-evans/enable-pull-request-automerge@v3
+#
+# Consumer (.github/workflows/auto-merge.yml):
+#   on: { pull_request: { types: [opened, labeled, synchronize] } }
+#   jobs:
+#     enable:
+#       uses: pleme-io/substrate/.github/workflows/ansible-collection-auto-merge.yml@main
+#
+# Enables squash auto-merge on any PR carrying the `automated` label (set by
+# upstream-watch and any other bot PRs). Requires repo Settings -> General ->
+# Pull Requests -> "Allow auto-merge" to be enabled (one-time human action).
+
+name: Ansible collection auto-merge
+
+on:
+  workflow_call: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  enable:
+    # A reusable workflow's `runs-on` executes in the CALLER's billing
+    # context, so a bare metered label here charges every PRIVATE consumer.
+    # That is what exhausted the org's Actions spending limit on 2026-08-08,
+    # after which every private repo's release path failed INSTANTLY with
+    # zero steps — which reads as "autobump/autorelease is broken" rather
+    # than "billing blocked". Public callers keep the exact label they had.
+    runs-on: ${{ github.event.repository.private && 'camelot-builder-pleme-eks' || 'ubuntu-latest' }}
+    if: contains(github.event.pull_request.labels.*.name, 'automated')
+    steps:
+      - uses: peter-evans/enable-pull-request-automerge@v3
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          pull-request-number: ${{ github.event.pull_request.number }}
+          merge-method: squash

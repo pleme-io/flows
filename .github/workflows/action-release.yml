@@ -1,0 +1,147 @@
+# Reusable workflow: GitHub Actions repo release.
+#
+# On a vMAJOR.MINOR.PATCH tag push:
+#   1. Validate every action.yml under the repo root (schema sanity)
+#   2. Fast-forward the matching major-version branch (v1.2.3 -> v1) so
+#      consumers pinning `@v1` get the latest minor/patch
+#   3. Create a GitHub Release named after the tag (auto-generated notes)
+#
+# Use this from any GH-Actions monorepo (or single-action repo) — drop
+# a thin wrapper in `.github/workflows/release.yml`:
+#
+#   on:
+#     push:
+#       tags: ['v*.*.*']
+#
+#   jobs:
+#     release:
+#       uses: pleme-io/substrate/.github/workflows/action-release.yml@main
+#       permissions:
+#         contents: write
+#
+# Trade-off: the matrix discovers action.yml files via `find` rather
+# than a hard-coded list; this keeps the workflow zero-config as the
+# monorepo grows.
+name: Action release
+
+on:
+  workflow_call:
+    inputs:
+      action-glob:
+        type: string
+        default: "**/action.yml"
+        description: "Glob (relative to repo root) used to discover action manifests for schema validation"
+      release-notes:
+        type: string
+        default: "auto"
+        description: "'auto' (use GitHub-generated notes) or literal markdown body"
+      major-ref:
+        type: string
+        default: ""
+        description: |
+          Floating-major ref to fast-forward. Empty (default) means derive
+          from the semver tag (v1.2.3 -> v1, v0.2.0 -> v0). Set to a
+          literal like `v1` to track an explicit major across 0.x and
+          1.x lines (useful when consumers pinned `@v1` before the repo
+          hit 1.0).
+
+permissions:
+  contents: write
+
+jobs:
+  # 1. Sanity-check every action.yml so a syntactically broken release
+  #    fails before we tag a major branch to it.
+  validate:
+    # A reusable workflow's `runs-on` executes in the CALLER's billing
+    # context, so a bare metered label here charges every PRIVATE consumer.
+    # That is what exhausted the org's Actions spending limit on 2026-08-08,
+    # after which every private repo's release path failed INSTANTLY with
+    # zero steps — which reads as "autobump/autorelease is broken" rather
+    # than "billing blocked". Public callers keep the exact label they had.
+    runs-on: ${{ github.event.repository.private && 'camelot-builder-pleme-eks' || 'ubuntu-latest' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # Was a `python3 - <<'PY'` heredoc carrying this whole check inline.
+      # Same semantics, verified branch by branch against fixtures: name+runs
+      # required, a composite must have non-empty steps, a non-mapping top
+      # level is an error, and a glob matching nothing stays a tolerated
+      # ::warning:: + exit 0 (the glob is a caller input; zero is a real
+      # answer here, unlike in pleme-io/actions where the count is fixed).
+      # ★ The script lives in SUBSTRATE, but every step above this one runs
+      # against the CONSUMER's checkout — so `tools/validate-action-manifests.tlisp`
+      # resolved relative to the caller and was never found. Measured
+      # 2026-08-08: pleme-io/actions run 31236737014, `script-file not found:
+      # tools/validate-action-manifests.tlisp`, and the release never validated
+      # anything. It is not a consumer bug — the file exists in exactly one
+      # repo (this one) and in no caller, so the job could only ever have
+      # failed. A reusable workflow that requires the consumer to ship a
+      # specific file is not reusable; it owns its own tooling.
+      - name: Check out substrate (for its validator)
+        uses: actions/checkout@v4
+        with:
+          repository: pleme-io/substrate
+          ref: main
+          path: .substrate-tools
+      - name: Validate action.yml manifests
+        uses: pleme-io/actions/tatara-script@main
+        env:
+          ACTION_GLOB: ${{ inputs.action-glob }}
+        with:
+          script-file: .substrate-tools/tools/validate-action-manifests.tlisp
+
+  # 2. Fast-forward the matching major-version branch and 3. cut a Release.
+  release:
+    needs: validate
+    # A reusable workflow's `runs-on` executes in the CALLER's billing
+    # context, so a bare metered label here charges every PRIVATE consumer.
+    # That is what exhausted the org's Actions spending limit on 2026-08-08,
+    # after which every private repo's release path failed INSTANTLY with
+    # zero steps — which reads as "autobump/autorelease is broken" rather
+    # than "billing blocked". Public callers keep the exact label they had.
+    runs-on: ${{ github.event.repository.private && 'camelot-builder-pleme-eks' || 'ubuntu-latest' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Resolve refs
+        id: tag
+        env:
+          MAJOR_REF_INPUT: ${{ inputs.major-ref }}
+        run: |
+          set -euo pipefail
+          ref="${GITHUB_REF##refs/tags/}"
+          if [ -n "$MAJOR_REF_INPUT" ]; then
+            major="$MAJOR_REF_INPUT"
+          else
+            major="${ref%%.*}"   # v1.2.3 -> v1
+          fi
+          echo "tag=$ref" >> "$GITHUB_OUTPUT"
+          echo "major=$major" >> "$GITHUB_OUTPUT"
+      - name: Fast-forward major branch
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+          MAJOR: ${{ steps.tag.outputs.major }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git push origin "+refs/tags/$TAG:refs/heads/$MAJOR"
+          echo "Pushed $MAJOR -> $TAG"
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          NOTES: ${{ inputs.release-notes }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; skipping"
+            exit 0
+          fi
+          if [ "$NOTES" = "auto" ]; then
+            gh release create "$TAG" --title "$TAG" --generate-notes
+          else
+            gh release create "$TAG" --title "$TAG" --notes "$NOTES"
+          fi

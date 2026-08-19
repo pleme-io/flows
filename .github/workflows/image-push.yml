@@ -1,0 +1,791 @@
+# Reusable workflow: build a Docker/OCI image with Nix and push to a registry.
+#
+# Usage (from a consumer repo):
+#
+#   jobs:
+#     image:
+#       uses: pleme-io/substrate/.github/workflows/image-push.yml@main
+#       with:
+#         imageAttr: dockerImage         # default: "dockerImage"
+#         tag: ${{ github.ref_name }}    # default: "latest"
+#         registry: ghcr.io              # default: "ghcr.io"
+#         imageName: ${{ github.repository }}  # default: ${{ github.repository }}
+#       secrets:
+#         GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}  # falls back to GITHUB_TOKEN
+#
+# Strategy:
+#   1. nix build .#<imageAttr>     -> produces a Docker image tarball at ./result
+#   2. nix run github:pleme-io/substrate#oci-push -- push ...
+#      (doca's native backend, pure-Rust oci-client, docker-archive -> registry)
+#
+# The flake must expose `packages.<system>.<imageAttr>` producing a Docker
+# image tarball (e.g. via pkgs.dockerTools.buildLayeredImage).
+#
+# ★ AUTOBUMP convention (org directive: pleme-io/CLAUDE.md ★★ AUTO-RELEASE →
+# "★ AUTOBUMP — exact-pin continuous delivery; never :latest"). On a merge to
+# main, pass a SORTABLE EXACT tag so subscribing environments auto-track the
+# newest build via Flux image-automation AND always know exactly what is running:
+#
+#     tag: <arch>-r${{ github.run_number }}-${{ github.sha }}
+#     # e.g.  amd64-r142-9c1f0ab   (r<n> is the numeric sort key; sha = trace)
+#
+# Build on a NATIVE-arch runner (`runner: rio-builder` for amd64) so the binary
+# matches the target — an off-target build mislabels the arch and `exec format
+# error`s at runtime. Use `additionalTags: <arch>-latest` ONLY as a human-facing
+# moving pointer; the DEPLOY target is always the exact `r<n>` tag, which a
+# cluster's committed `# {"$imagepolicy"}` marker pins. The `tag` default below
+# is `latest` for back-compat only — autobump-native repos MUST override it.
+#
+# ── scanBeforePush: the CVE gate belongs BEFORE the push, not after ───────
+# Found live 2026-07-19 (pangea-operator, tag embedded-amd64-r174): this
+# workflow's "Build image with Nix" step already materializes the full image
+# as a local tarball (`image.tar.gz`, right below) minutes before "Push image"
+# ever runs -- but historically nothing scanned that tarball, and any CVE gate
+# a CALLER bolted on afterward (a downstream job scanning the now-published
+# ghcr.io tag) runs AFTER the tag is already live-pollable by Flux's
+# ImagePolicy/ImageUpdateAutomation (★ AUTOBUMP). A build whose post-publish
+# scan job failed still had its vulnerable tag picked up and deployed --
+# confirmed live, ~1.5h of a CRITICAL-severity image running in-cluster before
+# the next (clean) build superseded it. A post-push gate can only ever be a
+# receipt of what already shipped; it structurally cannot prevent the ship.
+#
+# The fix ports the SAME pattern nix-image-auto-release.yml already shipped
+# (its own `scan-before-push` input, live since before this fix) into this
+# reusable: scan the LOCAL `image.tar.gz` via pleme-io/actions/image-scan's
+# `local-archive:` mode (trivy `--input`, no registry round-trip -- the image
+# has never touched a registry when this runs) BETWEEN the build step and the
+# push step. A failing scan stops the job here (GHA's default: a job halts at
+# its first failing step) -- "Login to registry" / "Push image" become
+# structurally unreachable on red, so a CVE-failing image can never reach the
+# registry at all. Flux can't poll a tag that was never pushed.
+#
+# `scanBeforePush` defaults to `false` -- every existing caller's exact
+# atomic build+push behavior is unchanged unless it opts in (same
+# zero-blast-radius shape as nix-image-auto-release.yml's own flag and as
+# `extraSubstituters`/`requireSigs` above).
+
+name: image-push
+
+on:
+  workflow_call:
+    inputs:
+      imageAttr:
+        description: "Flake output attribute that builds the image tarball"
+        type: string
+        default: "dockerImage"
+      tag:
+        description: "Image tag to push"
+        type: string
+        default: "latest"
+      autobumpArch:
+        description: >
+          When set (e.g. "embedded-amd64"), DERIVE the autobump tag instead of
+          taking `tag` — `<autobumpArch>-r<HEAD committer epoch>-<sha>`.
+
+          NOTE FOR EDITORS: never write a `$`+`{{ … }}` expression in prose
+          inside this (or any) `description:`. GitHub parses `description` as a
+          template, not as text, so an expression here is EVALUATED against the
+          `workflow_call.inputs` context — where `github.run_number` does not
+          exist. The result is `failed to parse workflow: error parsing called
+          workflow`, which fails EVERY repo that calls this reusable, with zero
+          jobs and no logs. A `#` comment is safe (GitHub never parses it); a
+          description is not. Measured 2026-08-10: this exact line took down
+          ensaio's releases fleet-wide.
+
+          Why this exists: the documented convention below used the RUN NUMBER
+          (`r<run_number>`) as the numeric sort key, which is a
+          property of the RUNNER, not of the software. Only GitHub Actions can
+          mint a correctly-ordered tag that way, so a CI outage becomes a
+          DELIVERY outage — the subscribing environment keeps working while
+          nothing can be produced for it to consume. Measured 2026-08-08: the
+          org's shared 5,000 req/hr credential was exhausted by an IaC
+          convergence, CI could not run, and the only way to ship was to guess
+          the next run number by hand.
+
+          HEAD's committer epoch is the same kind of key without that coupling:
+          numeric and monotonic on a branch, available at `fetch-depth: 1`
+          (unlike `rev-list --count`), and derivable identically on CI, a build
+          host, or a laptop via `git log -1 --format=%ct`.
+
+          Migration is automatic and needs no policy edit: an epoch (~1.7e9)
+          sorts permanently above any run number, and the tag still matches the
+          consumers' existing `^<arch>-r([0-9]+)-[0-9a-f]+$` ImagePolicy.
+        required: false
+        type: string
+        default: ""
+      registry:
+        description: "Target OCI registry"
+        type: string
+        default: "ghcr.io"
+      imageName:
+        description: "Image name (without registry / tag); default is the repo slug"
+        type: string
+        default: ""
+      flakeRef:
+        description: "Flake ref to build from"
+        type: string
+        default: "."
+      additionalTags:
+        description: "Space-separated extra tags to push alongside `tag` (e.g. 'latest v1')"
+        type: string
+        default: "latest"
+      runner:
+        description: "Explicit runner label override. Empty (default) routes through pleme-io/actions/runner-resolve's visibility-aware default -- private-repo callers land on Camelot's self-hosted pool, public-repo callers keep free GitHub-hosted minutes. Set this only when a caller genuinely needs something else (an arm64 pool, a macOS runner -- no self-hosted macOS capacity exists fleet-wide)."
+        type: string
+        default: ""
+      buildCores:
+        description: "nix --cores (per-derivation parallelism). Empty = nproc. Lower (e.g. 4) to cap peak RAM of heavy compiles (ruby/llvm) on memory-constrained self-hosted runners that OOM at nproc."
+        type: string
+        default: ""
+      maxJobs:
+        description: "nix --max-jobs (max concurrent derivations). Empty = nix default. Lower (e.g. 2) with a low buildCores to bound how many heavy builds stack at once on a small node."
+        type: string
+        default: ""
+      extraSubstituters:
+        description: "Extra Nix binary-cache URL(s) to pull from (space-separated). E.g. a self-hosted attic on the runner's node so heavy crates/gems SUBSTITUTE instead of compiling (the cure for cold-cache OOMs). Empty = no extra cache (zero blast radius for other consumers)."
+        type: string
+        default: ""
+      extraTrustedPublicKeys:
+        description: "Trusted public key(s) for extraSubstituters (space-separated, 'name:base64' form). Required when extraSubstituters is set, else Nix refuses the unsigned cache."
+        type: string
+        default: ""
+      netrcFile:
+        description: "Path to a netrc file (present on the runner) authenticating to extraSubstituters. For a token-gated attic cache, mount the read token as a netrc and point here. Empty = anonymous."
+        type: string
+        default: ""
+      requireSigs:
+        description: "Set 'false' to accept UNSIGNED NARs from extraSubstituters — e.g. the in-cluster sui super-cache daemon (http://sui.camelot-build.svc) serves unsigned closures. Empty = nix default (signatures required; zero blast radius for existing consumers)."
+        type: string
+        default: ""
+      superCacheSaveEndpoint:
+        description: "sui super-cache endpoint to PUSH the just-built imageAttr's store path to (e.g. http://sui.camelot-build.svc), via pleme-io/actions/super-cache-save. The write half of extraSubstituters above — without this, every caller that reads from sui never contributes back, so a from-source overlay pays a full cold rebuild on every single run forever, even after a successful build (mirrors nix-image-auto-release.yml's own input of the same name, added there first — pangea-operator's ci.yml/release.yml were the first callers found still missing it). Runs right after the local build and before the CVE gate, since the cache write is a pure content-addressed store-path push independent of what the scan later decides. Best-effort (never fails the job on a push error — see super-cache-save's own README). Empty (default) = no push, zero blast radius for existing consumers."
+        type: string
+        default: ""
+      scanBeforePush:
+        description: "Zero-tolerance CVE gate (theory/SECURITY-LAYER.md §8's 'build-time pre-publish CVE gate'; same shape as nix-image-auto-release.yml's own scan-before-push): scan the LOCAL image tarball built above with pleme-io/actions/image-scan (trivy --input, no registry round-trip -- the image has never been pushed anywhere at this point) and only run the push step if the scan is clean. False (default) preserves every existing caller's exact atomic build+push behavior unchanged -- opt in per consumer."
+        type: boolean
+        default: false
+      scanFailOnSeverity:
+        description: "Lowest severity that fails the scanBeforePush gate: UNKNOWN | LOW | MEDIUM | HIGH | CRITICAL | none. UNKNOWN = zero-tolerance (every severity gates). Only consulted when scanBeforePush is true."
+        type: string
+        default: "UNKNOWN"
+      scanIgnoreUnfixed:
+        description: "Skip vulns without an available fix in the scanBeforePush gate. Never loosen this as a substitute for a named, tracked .trivyignore exception. Only consulted when scanBeforePush is true."
+        type: string
+        default: "false"
+      scanIgnoreFile:
+        description: "Path (relative to the repo root) to a .trivyignore-format file of named, tracked exceptions for the scanBeforePush gate -- each entry must carry its own justification, never a blanket severity loosening. Empty (default) = no exceptions. Only consulted when scanBeforePush is true."
+        type: string
+        default: ""
+    secrets:
+      BOT_PAT:
+        description: "Org PAT with write:packages, preferred by registry-login for OCI push to the org-shared ghcr.io/pleme-io namespace (a repo-scoped GITHUB_TOKEN 403s cross-namespace). Reaches public repos only on the Free plan; private repos fall through to GITHUB_TOKEN."
+        required: false
+      GHCR_TOKEN:
+        description: "Optional dedicated registry token. registry-login prefers BOT_PAT, then this, then GITHUB_TOKEN."
+        required: false
+      ECR_TOKEN:
+        description: >-
+          Password for the SOURCE registry an image derivation PULLS FROM, when
+          that registry is private (lib/build/oci/hardened-base.nix's
+          `srcCredsEnv` / `srcCredsUser`). Orthogonal to BOT_PAT/GHCR_TOKEN,
+          which authenticate the DESTINATION push. The variable NAME is fixed
+          at `ECR_TOKEN` -- a `secrets:` key cannot be computed from an input,
+          and the consumer's `srcCredsEnv` must name the SAME string for the
+          derivation's `impureEnvVars` entry to match. Optional: absent, every
+          existing caller is byte-identical. Same input, same wiring, same
+          rationale as nix-image-auto-release.yml's -- an `imageAttr` that
+          happens to be a private-upstream vendor rewrap has the identical
+          need here, so it is solved in both reusables rather than one.
+        required: false
+
+jobs:
+  # Resolves the actual build runner via pleme-io/actions/runner-resolve
+  # (★★ AUTO-RELEASE + the org's standing CI-billing invariant: a path
+  # either flows through a genuinely public repo or Camelot's self-hosted
+  # pool, never a metered GitHub-hosted runner on a private repo). A
+  # separate job, not an inline step in `push`, because runs-on: cannot
+  # read a same-job step output (runner-resolve's own action.yml). This
+  # job's OWN runs-on can't call runner-resolve to resolve itself --
+  # it's the one place a visibility-only ternary is correct (the same
+  # pattern cargo-auto-release.yml already proved): the job does zero
+  # real work (one composite-action invocation), so it's cheap wherever
+  # it lands, but a metered GitHub-hosted runner still fails outright on
+  # a private repo under a billing/spending-limit gate (found live this
+  # session, pangea-operator's own resolve-runner job hit the identical
+  # class before its 2026-07-17 fix) -- so even this bootstrap job must
+  # not default to ubuntu-24.04 unconditionally.
+  resolve-runner:
+    name: resolve build runner
+    runs-on: ${{ github.event.repository.private && 'camelot-builder-pleme-eks' || 'ubuntu-24.04' }}
+    outputs:
+      runner: ${{ steps.resolve.outputs.runner }}
+    steps:
+      - id: resolve
+        uses: pleme-io/actions/runner-resolve@main
+        with:
+          override: ${{ inputs.runner }}
+
+  push:
+    name: Build & push image
+    needs: resolve-runner
+    runs-on: ${{ needs.resolve-runner.outputs.runner }}
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    env:
+      # Source-registry password for a private upstream pull, under the exact
+      # name hardened-base.nix's `srcCredsEnv` declares. Job-level so every nix
+      # invocation in the job carries it, not just today's `nix build` step.
+      # Covers the LocalStore (root runner) case only -- the daemon case is the
+      # `impure-env` line in the Install Nix step below, which explains why one
+      # env export is not sufficient on its own.
+      ECR_TOKEN: ${{ secrets.ECR_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      # Derive the autobump tag when `autobumpArch` is set (see that input).
+      # `%ct` is HEAD's COMMITTER date, not the author date: a rebase or
+      # cherry-pick rewrites it, so the key advances with the branch rather
+      # than with when someone first wrote the patch — which is what makes it
+      # monotonic on main.
+      - id: autobump
+        if: inputs.autobumpArch != ''
+        run: |
+          set -euo pipefail
+          echo "tag=${{ inputs.autobumpArch }}-r$(git log -1 --format=%ct)-$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      # CORRECTED 2026-07-23 (see the "SECOND, independent layer" comment
+      # below for the full mechanism): actions/checkout's git credentials
+      # ARE stored in THIS repo's local .git/config, but that does NOT mean
+      # they stay confined to operations on this repo's own remote -- git
+      # matches them by URL PREFIX (`https://github.com/`) against whatever
+      # a git command in this directory targets, so they DO intercept a
+      # separate `git clone`/`git fetch` of a DIFFERENT private repo unless
+      # explicitly unset (which the step below now does).
+      # `gen build` (below) shells out to the real `cargo metadata`, which
+      # clones every git-dependency in Cargo.toml into ~/.cargo/git/db/ using
+      # plain, ambient, unauthenticated HTTPS -- fine for public deps, a hard
+      # "failed to authenticate" for a private one (confirmed live 2026-07-23:
+      # pangea-operator's own `tsunagu` git dependency, blocking its release
+      # pipeline for hours). A global url.insteadOf rewrite makes every
+      # https://github.com/ fetch on this runner authenticate transparently,
+      # for cargo AND anything else that shells out to plain git -- fixed
+      # once, here, in the shared reusable, so every gen-based image build
+      # across the fleet with a private git dependency is covered, not just
+      # this one consumer.
+      #
+      # Same BOT_PAT > GHCR_TOKEN precedence this file already uses for
+      # registry auth (see registry-login below) -- pangea-operator's own
+      # caller only forwards its token as GHCR_TOKEN, never under the name
+      # BOT_PAT, so preferring BOT_PAT alone would silently no-op for
+      # exactly the consumer this was written for.
+      #
+      # No `if:` guard -- the `secrets` context is not permitted in a step
+      # `if:` conditional (GitHub Actions: "You can't use secrets in an if
+      # conditional... use environment variables instead" -- confirmed live
+      # via a rejected `gh workflow run` dispatch: "Unrecognized named-value:
+      # 'secrets'"). Running unconditionally is harmless: with neither
+      # secret set, GIT_AUTH_TOKEN is empty and the rewrite just makes
+      # unauthenticated fetches route through an empty-token URL -- no worse
+      # than the unauthenticated fetch that was already happening.
+      #
+      # `x-access-token:<token>@` is the correct git basic-auth URL form
+      # (matches `https://user:pass@host/`) -- confirmed live 2026-07-23: a
+      # token-alone-as-username attempt (no password field) made git hang
+      # trying to interactively PROMPT for a password ("could not read
+      # Password for 'https://github.com': No such device or address" --
+      # no TTY on a CI runner), never even reaching GitHub. This form DOES
+      # reach GitHub with both fields populated -- and GitHub responds with
+      # its own explicit "Invalid username or token. Password
+      # authentication is not supported for Git operations." That is a
+      # REJECTION of the credential VALUE, not a syntax problem: whatever
+      # GIT_AUTH_TOKEN resolves to (BOT_PAT, or GHCR_TOKEN as its fallback)
+      # is not a token GitHub accepts for cloning pleme-io/tsunagu. Left
+      # in this syntactically-correct form rather than guessing a further
+      # URL variant.
+      #
+      # RESOLVED 2026-07-23, two independent, stacked causes (both real,
+      # both now fixed) -- the "credential invalid" read above was correct
+      # as far as it went, but incomplete:
+      #   (1) pleme-io is a GitHub FREE-plan org. Free-tier orgs do not
+      #       deliver ORG-level Actions secrets to PRIVATE repos AT ALL
+      #       (only public ones) -- BOT_PAT's org-level "visibility: all"
+      #       is a silent no-op for a private repo like pangea-operator.
+      #       GIT_AUTH_TOKEN was therefore genuinely EMPTY here, proven by
+      #       the pre-flight diagnostic below: with it empty, 5 of 6
+      #       pleme-io git deps (all PUBLIC) still cloned fine anonymously;
+      #       only the 1 PRIVATE dep (tsunagu) failed. No amount of
+      #       rotating the org secret can fix this -- the fix is a
+      #       REPO-LEVEL secret of the same name on the consuming repo
+      #       (always reaches its own repo regardless of org plan tier;
+      #       takes precedence over an org-level secret of the same name).
+      #   (2) EVEN with a valid, non-empty GIT_AUTH_TOKEN (confirmed via a
+      #       plain `curl` to the GitHub API returning 200 for tsunagu, in
+      #       the SAME job), `git ls-remote` against tsunagu STILL failed
+      #       with "repository not found" -- the SECOND layer, see the
+      #       "SECOND, independent layer" comment above this step:
+      #       actions/checkout's own persisted local credential silently
+      #       wins over this line's rewrite for any git operation against a
+      #       DIFFERENT repo, unless explicitly unset (now done, above).
+      # See project_gem_ci_shim_reconciler.md for the full incident chain.
+      # SECOND, independent layer of the same incident, root-caused 2026-07-23
+      # AFTER the global url.insteadOf rewrite (below) and a verified-valid
+      # GIT_AUTH_TOKEN were both confirmed working in isolation, yet a real
+      # `git ls-remote` against a private dependency STILL failed with
+      # "repository not found" -- while a plain `curl` to the GitHub API
+      # using the SAME token, in the SAME job, returned 200 (full read
+      # access) for the SAME repo. That split (API: authenticated fine: 200
+      # / git: rejected as if unauthenticated) is the signature of a SECOND
+      # credential silently winning over the first, not of a bad token.
+      #
+      # `actions/checkout@v4` (the step just above) persists its OWN
+      # ephemeral, checkout-repo-scoped GITHUB_TOKEN as a LOCAL git config
+      # entry: `git config --local http.https://github.com/.extraheader
+      # AUTHORIZATION: basic ***` (visible in its own step log). "Local"
+      # means "stored in THIS checkout's .git/config" -- it does NOT mean
+      # "only affects operations on this checkout's own remote". Git matches
+      # `http.<url>.extraheader` by URL PREFIX (`https://github.com/`)
+      # against the ACTUAL request URL, and applies whenever a git command
+      # runs with this checkout as its working directory -- including a
+      # `git ls-remote`/`git fetch` aimed at a COMPLETELY DIFFERENT repo
+      # (tsunagu, here). That extraheader wins over BOTH the global
+      # url.insteadOf rewrite below AND any credentials embedded directly in
+      # the target URL, so every git-level clone of a different private repo
+      # silently authenticates as the checkout's OWN repo-scoped token --
+      # which structurally cannot see any other private repo -- producing
+      # exactly "remote: Repository not found", indistinguishable from a bad
+      # credential unless you cross-check against a git-config-free request
+      # (the pre-flight diagnostic's own `curl` call) the way this incident
+      # was actually root-caused. (An earlier comment on this same step
+      # claimed checkout's credentials "do not propagate to a separate git
+      # clone" -- that undersold the real mechanism: propagation is real,
+      # scoped by URL prefix, and is exactly what this unset below removes.)
+      #
+      # Safe to remove here: checkout has already completed everything it
+      # needs this credential for by this point in the job.
+      - name: Configure git credentials for private git dependencies (cargo, gen)
+        env:
+          GIT_AUTH_TOKEN: ${{ secrets.BOT_PAT || secrets.GHCR_TOKEN }}
+        run: |
+          git config --global url."https://x-access-token:${GIT_AUTH_TOKEN}@github.com/".insteadOf "https://github.com/"
+          git config --unset-all http.https://github.com/.extraheader || true
+
+      # Fast, cheap, EARLY diagnostic for the private-git-dependency credential
+      # class of failure (root-caused 2026-07-23 -- see the step above for the
+      # incident chain: three URL-syntax guesses, each costing a ~25min Nix
+      # build cycle to fail, before anything checked whether the CREDENTIAL
+      # ITSELF -- as opposed to the URL syntax wrapping it -- was ever valid).
+      # Runs BEFORE "Install Nix" (needs only git + curl, both already assumed
+      # present by the step above) so a bad credential is caught in seconds,
+      # not 25 minutes into a build, with a diagnosis naming the SPECIFIC
+      # cause (empty secret / invalid-or-expired token / fine-grained-PAT
+      # allowlist gap) instead of cargo's generic "spurious network error" or
+      # git's generic "could not read Password".
+      #
+      # Zero blast radius for every consumer with no private git dependency:
+      # skips cleanly the moment Cargo.lock is absent or has no
+      # `git+https://github.com/pleme-io/...` entry (same gating shape the
+      # Cargo.gen.lock freshness check below already uses).
+      - name: Diagnose private git-dependency credential (fast pre-flight)
+        env:
+          GIT_AUTH_TOKEN: ${{ secrets.BOT_PAT || secrets.GHCR_TOKEN }}
+        run: |
+          set -uo pipefail
+
+          if [ ! -f Cargo.lock ]; then
+            echo "No Cargo.lock in this repo -- nothing to pre-flight, skipping."
+            exit 0
+          fi
+
+          grep -oE 'git\+https://github\.com/pleme-io/[A-Za-z0-9_.-]+' Cargo.lock \
+            | sed 's/^git+//' | sort -u > /tmp/private_dep_urls.txt || true
+          dep_count=$(wc -l < /tmp/private_dep_urls.txt | tr -d ' ')
+
+          if [ "$dep_count" -eq 0 ]; then
+            echo "No pleme-io git dependencies in Cargo.lock -- nothing to pre-flight, skipping."
+            exit 0
+          fi
+
+          echo "Found $dep_count pleme-io git dependenc(y/ies) in Cargo.lock:"
+          sed 's/^/  - /' /tmp/private_dep_urls.txt
+
+          if [ -z "${GIT_AUTH_TOKEN}" ]; then
+            echo "::warning::GIT_AUTH_TOKEN is EMPTY -- both secrets.BOT_PAT and secrets.GHCR_TOKEN resolved unset in this job's context. Any PRIVATE repo among the deps above will fail to clone. Two known causes, root-caused live 2026-07-23 (see pangea-operator's incident): (1) the caller workflow uses an explicit 'secrets:' mapping (not 'secrets: inherit') that forgot to map BOT_PAT/GHCR_TOKEN through -- check the caller's job; (2) THE MORE LIKELY CAUSE if the caller DOES map it correctly: pleme-io is a GitHub FREE-plan org, and GitHub Free-tier orgs do NOT deliver org-level Actions secrets to PRIVATE repos at all (only to public ones) -- the org secret's 'visibility: all' setting is a silent no-op for a private repo on Free. Fix: set a REPO-LEVEL secret of the same name directly on the consuming repo (e.g. 'gh secret set BOT_PAT --repo <owner>/<repo> < ~/.config/github/classic') -- a repo-level secret always reaches its own repo's workflows regardless of org plan tier, and takes precedence over an org-level secret of the same name."
+          else
+            echo "GIT_AUTH_TOKEN is non-empty (${#GIT_AUTH_TOKEN} chars)."
+          fi
+
+          fail=0
+          while IFS= read -r url; do
+            [ -z "$url" ] && continue
+            repo_path="${url#https://github.com/}"
+            echo "::group::pre-flight: $url"
+
+            api_status=$(curl -s -o /tmp/repo_api.json -w "%{http_code}" \
+              -H "Authorization: token ${GIT_AUTH_TOKEN}" \
+              "https://api.github.com/repos/${repo_path}")
+            echo "GitHub API GET /repos/${repo_path} -> HTTP ${api_status}"
+
+            if git -c credential.helper= ls-remote "https://x-access-token:${GIT_AUTH_TOKEN}@github.com/${repo_path}.git" HEAD >/tmp/ls_remote.out 2>/tmp/ls_remote.err; then
+              echo "OK: git ls-remote succeeded."
+            else
+              fail=1
+              echo "::error::pre-flight FAILED for ${url}"
+              cat /tmp/ls_remote.err
+              case "$api_status" in
+                401)
+                  if [ -z "${GIT_AUTH_TOKEN}" ]; then
+                    echo "::error::DIAGNOSIS: GIT_AUTH_TOKEN is EMPTY (see the warning above for the two known causes -- on pleme-io specifically, the GitHub FREE-plan org-secret-to-private-repo restriction is the likely one; set a repo-level secret)."
+                  else
+                    echo "::error::DIAGNOSIS: GitHub API returned 401 for ${repo_path} with a NON-EMPTY token -- the token value itself is invalid, expired, or malformed (NOT a scope/permission issue -- a valid-but-underscoped token would 404, not 401). Rotate/regenerate the credential."
+                  fi
+                  ;;
+                404)
+                  echo "::error::DIAGNOSIS: GitHub API returned 404 for ${repo_path} -- the token authenticates but cannot see this specific repo. If BOT_PAT is a FINE-GRAINED PAT, add ${repo_path} to its repository access allowlist: GitHub -> Settings -> Developer settings -> Personal access tokens -> Fine-grained tokens -> BOT_PAT -> Repository access."
+                  ;;
+                200)
+                  echo "::error::DIAGNOSIS: GitHub API sees ${repo_path} fine (200) but git ls-remote still failed -- inconsistent with a simple credential problem; the token may lack git-clone-specific permissions (fine-grained PATs need explicit 'Contents: Read' repository permission, distinct from general API read access) or something else is wrong. Investigate manually."
+                  ;;
+                *)
+                  echo "::error::DIAGNOSIS: unexpected GitHub API status ${api_status} for ${repo_path} -- see the response body above (/tmp/repo_api.json in this step's raw output)."
+                  ;;
+              esac
+            fi
+            echo "::endgroup::"
+          done < /tmp/private_dep_urls.txt
+
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::One or more private git dependencies failed pre-flight -- see diagnoses above. Failing fast here instead of burning ~25 minutes into a Nix build to hit the identical failure as a generic 'spurious network error' / 'could not read Password'."
+            exit 1
+          fi
+
+          echo "All private git dependencies pre-flight OK."
+
+      # ── Nix git-fetcher credential (fixed here, 2026-07-23) ─────────────
+      # THIRD, independent credential layer -- distinct from cargo's git-
+      # fetch (url.insteadOf + CARGO_NET_GIT_FETCH_WITH_CLI, fixed above)
+      # AND from access-tokens below (kept, but confirmed INSUFFICIENT on
+      # its own): access-tokens authenticates NIX'S OWN internal HTTP
+      # fetcher (tarball / GitHub-API-based flake refs), but a fetchgit-
+      # shaped fixed-output derivation (what gen's lockfile-builder emits
+      # for a git Cargo dependency, e.g. tsunagu-<rev>.drv) shells out to
+      # the REAL `git` binary inside its sandbox -- confirmed live:
+      # "Initialized empty Git repository ... fatal: could not read
+      # Username for 'https://github.com'" even with access-tokens already
+      # set in the same nix.conf. That sandboxed git process does NOT
+      # inherit the runner's ~/.gitconfig (a fresh, isolated $HOME -- same
+      # isolation class as the cargo-vs-checkout-extraheader bug above, one
+      # layer deeper) and does not consult access-tokens either; it needs
+      # its own credential via a netrc file, which Nix's fetchgit builder
+      # DOES read when nix.conf's netrc-file points at one -- the same
+      # mechanism the attic-cache netrcFile input already used, generalized
+      # here to also cover github.com.
+      #
+      # Generates ONE combined netrc: a github.com stanza (this token) plus,
+      # when the caller also passed netrcFile (image-rio's attic-cache
+      # case), that file's own content appended -- so both credentials
+      # coexist in the single file nix.conf's netrc-file can point at.
+      - name: Prepare Nix netrc for private git fetches
+        env:
+          GIT_AUTH_TOKEN: ${{ secrets.BOT_PAT || secrets.GHCR_TOKEN }}
+          EXTRA_NETRC: ${{ inputs.netrcFile }}
+        run: |
+          netrc_path="${RUNNER_TEMP}/nix-git-netrc"
+          {
+            echo "machine github.com"
+            echo "login x-access-token"
+            echo "password ${GIT_AUTH_TOKEN}"
+          } > "$netrc_path"
+          if [ -n "${EXTRA_NETRC}" ] && [ -f "${EXTRA_NETRC}" ]; then
+            cat "${EXTRA_NETRC}" >> "$netrc_path"
+          fi
+          chmod 600 "$netrc_path"
+          echo "NIX_GIT_NETRC_PATH=${netrc_path}" >> "$GITHUB_ENV"
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+        with:
+          github-token: ${{ secrets.BOT_PAT }}
+          # pleme-io's default build pattern is IFD-self-derive: gen-based
+          # crates (tatara-lisp and friends) generate their Cargo build spec
+          # via an Import-From-Derivation marked `__noChroot`. The strict
+          # default (`sandbox = true`) rejects `__noChroot` outright
+          # ("has '__noChroot' set, but that's not allowed when 'sandbox' is
+          # 'true'"), breaking every action-image build that bundles a tlisp
+          # interpreter.
+          #
+          # Determinate Nix manages its own daemon config and ignores an
+          # `extra-conf` sandbox override (and its FlakeHub cache 401s for
+          # this org anyway, so it buys nothing here). Install upstream Nix
+          # instead, where `extra-conf` is honored: `sandbox = relaxed`
+          # keeps the sandbox for ordinary derivations and only un-sandboxes
+          # those that explicitly opt in via `__noChroot`.
+          determinate: false
+          # The attic lines are injected into the DAEMON nix.conf at install
+          # time (trusted), so extra-substituters + extra-trusted-public-keys are
+          # honored regardless of trusted-user status. Empty inputs render blank
+          # lines → zero effect for consumers that don't opt in. netrc-file
+          # authenticates a token-gated cache (the file is mounted on the runner).
+          #
+          # access-tokens (added here, 2026-07-23) is a THIRD, independent
+          # credential layer from the two already fixed in this file (cargo's
+          # git-fetch via url.insteadOf + CARGO_NET_GIT_FETCH_WITH_CLI, and
+          # the pre-flight diagnostic below): Nix's OWN git fetcher for
+          # private flake inputs / fetchGit derivations (e.g. tsunagu, when
+          # it's a Nix build dependency, not just a Cargo one) runs INSIDE
+          # the fixed-output-derivation sandbox, which does NOT inherit the
+          # runner's ~/.gitconfig at all -- confirmed live: "fatal: could not
+          # read Username for 'https://github.com'" building
+          # tsunagu-<rev>.drv, in the SAME job whose cargo-level credential
+          # step had already succeeded minutes earlier. Setting it here (the
+          # DAEMON nix.conf, trusted at install time) makes it honored by the
+          # sandboxed fetcher regardless of trusted-user status, the same way
+          # the attic lines above already are.
+          #
+          # impure-env (added alongside, same placement, same reason) is a
+          # FOURTH credential layer, and the one that reaches a PRIVATE SOURCE
+          # REGISTRY: hardened-base.nix pulls an upstream image in a
+          # fixed-output derivation carrying `impureEnvVars = [ <srcCredsEnv> ]`,
+          # and that attribute reads the environment of the BUILDER process,
+          # not of the `nix build` that asked for it. Nix's manual, verbatim:
+          # "When a daemon is building its environmental variables are used.
+          # Without the daemon, the environmental variables come from the
+          # environment of the nix-build." MEASURED: a FOD declaring
+          # `impureEnvVars = [ "PROBE_VAR" ]` built through a daemon store with
+          # PROBE_VAR exported in the client's environment saw it UNSET -- so
+          # the job-level ECR_TOKEN export above lands only when the job runs as
+          # root and `store = auto` resolves to LocalStore. `impure-env` is the
+          # supported client-supplied route and is gated on the
+          # `configurable-impure-env` experimental feature; BOTH lines must be
+          # in the DAEMON nix.conf, because `RemoteStore::setOptions` erases
+          # `experimental-features` from the overrides a client forwards over
+          # the socket. Gated on the secret, so a caller passing none renders
+          # two blank lines and an unchanged nix.conf. Sharp edge: `impure-env`
+          # is a whitespace-separated `name=value` list, so a token containing a
+          # space is truncated at the space instead of rejected -- harmless for
+          # the base64/JWT-shaped registry tokens this is for, worth knowing.
+          extra-conf: |
+            sandbox = relaxed
+            access-tokens = github.com=${{ secrets.BOT_PAT || secrets.GHCR_TOKEN }}
+            netrc-file = ${{ env.NIX_GIT_NETRC_PATH }}
+            ${{ secrets.ECR_TOKEN && 'extra-experimental-features = configurable-impure-env' || '' }}
+            ${{ secrets.ECR_TOKEN && format('impure-env = ECR_TOKEN={0}', secrets.ECR_TOKEN) || '' }}
+            ${{ inputs.extraSubstituters && format('extra-substituters = {0}', inputs.extraSubstituters) || '' }}
+            ${{ inputs.extraTrustedPublicKeys && format('extra-trusted-public-keys = {0}', inputs.extraTrustedPublicKeys) || '' }}
+            ${{ inputs.requireSigs && format('require-sigs = {0}', inputs.requireSigs) || '' }}
+            # ── ★ AN UNREACHABLE CACHE MUST NOT KILL THE BUILD ──────────────
+            # Without these two, a configured-but-unreachable substituter is
+            # FATAL: nix aborts the build instead of falling back to building
+            # from source. MEASURED — hardened-images run 30665557380
+            # (release-clickhouse-keeper) died with
+            #   error: unable to download 'http://sui.camelot-build.svc/….narinfo':
+            #   Timeout was reached (28)
+            # A build cache is an OPTIMISATION; it must never be a liveness
+            # dependency of the thing it accelerates.
+            #
+            # The sibling `nix-image-auto-release.yml:430-431` has carried both
+            # lines; this workflow — the more widely-called of the two — did
+            # not. Same gate (`extraSubstituters` non-empty), so a consumer
+            # that configures no cache is byte-unaffected, and the pair can
+            # only ever loosen a failure into a slower success.
+            ${{ inputs.extraSubstituters && 'fallback = true' || '' }}
+            ${{ inputs.extraSubstituters && 'connect-timeout = 5' || '' }}
+
+      # gen-lockfile freshness gate — conditional, zero blast radius for
+      # non-gen consumers (a bare `[ -f Cargo.gen.lock ]` guard skips
+      # cleanly when the file doesn't exist). ADDED 2026-07-19: breathe's
+      # own fc6d1e0 (a real, already-committed fix) sat unbuilt for ~15
+      # hours because a PRIOR commit changed Cargo.lock without
+      # regenerating Cargo.gen.lock, and `nix build`'s own failure mode for
+      # this — "error: lockfile-delta: Cargo.gen.lock is STALE" — surfaces
+      # 30-40s into a build, buried in a wall of Nix eval output, with no
+      # CI-level signal distinguishing it from any other build failure.
+      # This is the SAME class of bug breathe itself hit once before
+      # (ae489ea) — a recurring failure mode, not a one-off, and exactly
+      # the shape GEN-TYPED-SPEC-CONTRACT names as a CI-enforced invariant
+      # ("stale specs are a CI failure, not a runtime fetch failure"; org
+      # CLAUDE.md ★★ GEN TYPED-SPEC CONTRACT). Fixed here once, in the
+      # shared reusable, rather than per-consumer, so every gen-based
+      # image build across the fleet gets an early, loud, actionable
+      # failure instead of a buried eval error.
+      - name: Check Cargo.gen.lock freshness (gen consumers only)
+        env:
+          NIX_CONFIG: "experimental-features = nix-command flakes"
+          # Cargo's DEFAULT git backend is its own bundled libgit2, which does
+          # NOT reliably honor ~/.gitconfig's url.insteadOf rewrite or a
+          # credential helper the way real git does -- confirmed live
+          # 2026-07-23: the "Configure git credentials" step above ran clean,
+          # yet `cargo metadata` still failed to authenticate cloning a
+          # private git dependency, identically to before that step existed.
+          # This env var is Cargo's own documented fix (the ORIGINAL error's
+          # own hint text: "if the git CLI succeeds then net.git-fetch-with-cli
+          # may help" -- https://doc.rust-lang.org/cargo/reference/config.html#netgit-fetch-with-cli)
+          # -- it forces Cargo to shell out to the real git binary for every
+          # git operation, which DOES respect the rewrite above.
+          CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+        run: |
+          set -euo pipefail
+          if [ ! -f Cargo.gen.lock ]; then
+            echo "No Cargo.gen.lock in this repo — not a gen consumer, skipping."
+            exit 0
+          fi
+          # `gen build` shells out to the literal `cargo metadata` binary (not
+          # a Nix-mediated call) to read the workspace graph. GitHub-hosted
+          # runners ship a pre-installed Rust toolchain, so this was always
+          # silently relying on that; self-hosted pools (e.g. Camelot's
+          # camelot-builder-pleme-eks ARC runners) carry no such toolchain by
+          # default, so `cargo metadata` fails with a bare "No such file or
+          # directory" the moment a consumer's runner input moves off a
+          # GitHub-hosted default (confirmed live: pangea-operator's release
+          # pipeline broke this exact way the day it retargeted off
+          # ubuntu-latest). Providing `cargo` via `nix shell nixpkgs#cargo`
+          # is the hermetic fix — no imperative install, works identically on
+          # every runner regardless of what it ships with. `git` is included
+          # too (defensive, same hermeticity reasoning) — CARGO_NET_GIT_FETCH_WITH_CLI
+          # above needs a real git binary on PATH inside this shell, and a
+          # self-hosted runner shipping no toolchain at all can't be assumed
+          # to ship git either.
+          # `nixpkgs#rustc` is NOT optional padding next to `nixpkgs#cargo`:
+          # `cargo metadata` shells out to `rustc -vV`, and cargo alone leaves
+          # that resolving against whatever the runner has on PATH. On a
+          # GitHub-hosted runner that is rustup's SHIM, which then reads the
+          # consumer's `rust-toolchain.toml`, tries to materialize the pinned
+          # channel, and fails — confirmed live on hanabi (pins
+          # channel = "1.88" + clippy/rustfmt): "syncing channel updates for
+          # 1.88 ... component download failed for clippy ... could not rename
+          # 'downloaded' file". Reproduced identically on re-run, so it is a
+          # deterministic hole in this step, not a flaky network.
+          #
+          # Supplying rustc from the same nixpkgs makes the toolchain fully
+          # hermetic, which is what the comment above already claims this line
+          # achieves. It also means a consumer's rust-toolchain.toml can no
+          # longer reach out to the network from inside an image build.
+          nix shell nixpkgs#cargo nixpkgs#rustc nixpkgs#git --command nix run github:pleme-io/gen -- build .
+          if ! git diff --exit-code Cargo.gen.lock; then
+            echo "::error::Cargo.gen.lock is stale relative to Cargo.lock. Run 'gen build .' locally, commit the regenerated Cargo.gen.lock, and push before this build can succeed."
+            exit 1
+          fi
+
+      # `nix build` writes ./result as a symlink into /nix/store/...
+      # Materialize the actual tarball into the workspace (a real file
+      # under /github/workspace, not a store symlink) before handing off —
+      # doca's native backend (below) reads the tarball by plain path.
+      - name: Build image with Nix
+        env:
+          BUILD_CORES: ${{ inputs.buildCores }}
+          MAX_JOBS: ${{ inputs.maxJobs }}
+          # Some self-hosted runners (the nix-built arc-runner image) carry a
+          # baked nix with NO flakes config that shadows the Determinate-installed
+          # one on PATH → `nix build` errors "experimental Nix feature
+          # 'nix-command' is disabled". NIX_CONFIG is honored by ANY nix
+          # regardless of which wins the PATH, so enable nix-command + flakes here.
+          NIX_CONFIG: "experimental-features = nix-command flakes"
+        run: |
+          # Optional parallelism caps for memory-constrained runners: a high
+          # nproc compile (e.g. ruby-3.4.9 from source) can spike peak RAM past a
+          # small self-hosted node's free memory and get OOM-killed (signal 9).
+          # --cores bounds per-derivation parallelism; --max-jobs bounds concurrent
+          # derivations. Empty inputs leave nix at its defaults (zero blast radius
+          # for beefy runners).
+          FLAGS=""
+          if [ -n "$BUILD_CORES" ]; then FLAGS="$FLAGS --cores $BUILD_CORES"; fi
+          if [ -n "$MAX_JOBS" ]; then FLAGS="$FLAGS --max-jobs $MAX_JOBS"; fi
+          echo "nix build parallelism flags:${FLAGS:- (defaults)}"
+          nix build "${{ inputs.flakeRef }}#${{ inputs.imageAttr }}" --print-out-paths $FLAGS
+          cp -L result image.tar.gz
+
+      # Write half of extraSubstituters above -- the built store path becomes
+      # a durable, content-addressed cache entry so a from-source overlay is
+      # only ever compiled once fleet-wide, not once per caller per run.
+      # `result` is the standard `nix build` output symlink the step above
+      # just created. Mirrors nix-image-auto-release.yml's own "Push built
+      # image to super-cache" step; empty endpoint (default) = no-op.
+      - name: Push built image to super-cache (sui)
+        if: inputs.superCacheSaveEndpoint != ''
+        uses: pleme-io/actions/super-cache-save@main
+        with:
+          endpoint: ${{ inputs.superCacheSaveEndpoint }}
+          outputs: ${{ github.workspace }}/result
+          key: ${{ inputs.imageAttr }}
+
+      # Pre-publish CVE gate -- scans the tarball built above, which has not
+      # touched a registry yet. Skipped entirely (default) for callers that
+      # haven't opted in, preserving their exact prior behavior. A failing
+      # scan halts the job here (GHA's default first-failing-step behavior),
+      # so "Login to registry" / "Push image" below are structurally
+      # unreachable on red -- see the scanBeforePush header comment at the
+      # top of this file for the incident this closes.
+      - name: Zero-tolerance CVE gate (pre-publish — scans the LOCAL tarball, never a pushed image)
+        if: inputs.scanBeforePush
+        uses: pleme-io/actions/image-scan@main
+        with:
+          image-ref: ${{ inputs.registry }}/${{ inputs.imageName || github.repository }}:${{ steps.autobump.outputs.tag || inputs.tag }}
+          local-archive: image.tar.gz
+          fail-on-severity: ${{ inputs.scanFailOnSeverity }}
+          ignore-unfixed: ${{ inputs.scanIgnoreUnfixed }}
+          ignore-file: ${{ inputs.scanIgnoreFile }}
+
+      # Token-resolution overlay: BOT_PAT > GHCR_TOKEN > GITHUB_TOKEN lives
+      # ONCE in the registry-login action (client: docker → ~/.docker/config.json,
+      # which the doca push step below reads the resolved token back out of).
+      - name: Login to registry
+        uses: pleme-io/actions/registry-login@main
+        with:
+          registry: ${{ inputs.registry }}
+          client: docker
+          username: ${{ github.actor }}
+          bot-pat: ${{ secrets.BOT_PAT }}
+          ghcr-token: ${{ secrets.GHCR_TOKEN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # Push with doca's NATIVE backend (`substrate/tools/oci-push`, pure-Rust
+      # oci-client — the typed replacement for the host-nix skopeo shell-out
+      # this step used to be). Originally went through
+      # pleme-io/actions/oci-image-push@v1, then host-nix skopeo (a Docker
+      # action whose base image is published by THIS workflow is a bootstrap
+      # cycle skopeo broke). doca avoids the same cycle a different way: it
+      # is fetched + built straight from the substrate flake via
+      # `nix run github:pleme-io/substrate#oci-push`, never a pre-built OCI
+      # image, so there's nothing here for this workflow to have to publish
+      # first. Proven working end-to-end (real ghcr.io push + inspect) by
+      # `substrate/.github/workflows/doca-selftest.yml`; this step mirrors
+      # that exact invocation.
+      - name: Push image (doca native backend)
+        env:
+          REGISTRY: ${{ inputs.registry }}
+          IMAGE:    ${{ inputs.imageName || github.repository }}
+          TAG:      ${{ steps.autobump.outputs.tag || inputs.tag }}
+          ADDITIONAL_TAGS: ${{ inputs.additionalTags }}
+          # Some self-hosted runners carry a baked nix with no flakes config
+          # (see the "Install Nix" step's own NIX_CONFIG note above) —
+          # `nix run` needs the same feature gate `nix build` does.
+          NIX_CONFIG: "experimental-features = nix-command flakes"
+        run: |
+          set -euo pipefail
+          # The registry-login step above already resolved the ONE typed
+          # credential precedence (BOT_PAT > GHCR_TOKEN > GITHUB_TOKEN, owned
+          # by registry-login/run.tlisp) and docker-login'd it into
+          # ~/.docker/config.json. doca's native backend takes an explicit
+          # --dest-pass (it doesn't read a docker config file), so read the
+          # already-resolved token back out of that file instead of
+          # re-deriving the precedence here as a second `||` chain.
+          auth_b64=$(jq -r --arg h "$REGISTRY" '.auths[$h].auth // empty' "$HOME/.docker/config.json")
+          if [ -z "$auth_b64" ]; then
+            echo "::error::no docker credential found for '${REGISTRY}' in ~/.docker/config.json (the registry-login step above should have written one)"
+            exit 1
+          fi
+          dest_pass="$(printf '%s' "$auth_b64" | base64 -d | cut -d: -f2-)"
+          echo "::add-mask::$dest_pass"
+          # Primary tag + every additionalTag in one call — oci-push pushes
+          # all requested tags against one parsed/gzipped archive (blobs are
+          # HEAD-deduped by oci-client, so repeat tags are cheap).
+          nix run github:pleme-io/substrate#oci-push -- push \
+            --backend native \
+            --registry "$REGISTRY" \
+            --image "$IMAGE" \
+            --tag "$TAG" \
+            --additional-tags "$ADDITIONAL_TAGS" \
+            --tarball ./image.tar.gz \
+            --dest-user "${{ github.actor }}" \
+            --dest-pass "$dest_pass"

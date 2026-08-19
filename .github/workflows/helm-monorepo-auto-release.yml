@@ -1,0 +1,147 @@
+# Reusable workflow: publish ALL charts in a Helm MONOREPO to an OCI registry
+# on push to main — the AUTO-RELEASE (default-on, ship-on-merge) shape for repos
+# that hold many charts under `charts/*` with NO single root Chart.yaml.
+#
+# Why this exists (vs the single-chart helm-auto-release.yml):
+#   The canonical single-chart shim reads ONE Chart.yaml at the repo root and
+#   auto-bumps its patch version. A chart monorepo (helmworks, helmworks-akeyless)
+#   has no root Chart.yaml — detect-repo-type returns `unknown` and helm-bump has
+#   nothing to bump. This workflow instead wraps the already-proven aggregate
+#   engine `nix run .#release` (= forge helm release-all: discover → lint →
+#   package → push), which 404-probes each (name, version) and SKIPS anything
+#   already published. So it is naturally idempotent.
+#
+# Version model — IMPORTANT: there is NO auto-bump here. The monorepo has no
+# single version to bump; each chart's version is hand-bumped in its own
+# Chart.yaml in the commit that changes it. This workflow is *publish-on-merge of
+# already-bumped Chart.yaml versions*: every push to main re-runs release-all,
+# which publishes only the charts whose on-disk version is not yet on the
+# registry and skips the rest. Bumping a chart = the act that makes it ship.
+#
+# Package visibility: this workflow does NOT change ghcr package visibility — it
+# only pushes. New packages inherit the org/repo default; per-package
+# public/private is set out-of-band (a private chart's package must be made
+# private once at creation). It never flips an existing public chart private
+# (rio FluxCD pulls the public ones), nor vice-versa.
+#
+# Usage (consumer repo, the whole footprint):
+#   # .github/workflows/auto-release.yml
+#   on: { push: { branches: [main] } }
+#   jobs:
+#     release:
+#       uses: pleme-io/substrate/.github/workflows/helm-monorepo-auto-release.yml@main
+#       secrets: inherit
+
+name: helm-monorepo-auto-release
+
+on:
+  workflow_call:
+    inputs:
+      registry:
+        description: "OCI registry URL (oci:// scheme) the charts publish to."
+        type: string
+        default: "oci://ghcr.io/pleme-io/charts"
+      release-app:
+        description: "The flake app that runs forge helm release-all (nix run .#<app>)."
+        type: string
+        default: "release"
+      runner:
+        description: "Explicit runner label override; empty = route by caller repo visibility (private → camelot-builder-pleme-eks, public → ubuntu-24.04). Do NOT put an expression in this default — workflow_call input defaults are static; the fallback lives in the job's runs-on."
+        type: string
+        default: ""
+    secrets:
+      BOT_PAT:
+        description: "Org PAT with write:packages, preferred by registry-login for OCI push to the org-shared ghcr.io/pleme-io/charts namespace (a repo-scoped GITHUB_TOKEN 403s cross-namespace). Reaches public repos only on the Free plan; private repos fall through to GITHUB_TOKEN."
+        required: false
+      GHCR_TOKEN:
+        description: "Optional dedicated registry token. registry-login prefers BOT_PAT, then this, then GITHUB_TOKEN."
+        required: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    name: Publish all bumped charts
+    # Runner routing: empty input routes by CALLER repo visibility — private
+    # repos → camelot-builder-pleme-eks (pleme-io-org ARC pool, avoids billed
+    # hosted minutes), public repos → ubuntu-24.04 (unmetered). Keyed off
+    # github.event.repository.private (the caller's event payload) rather
+    # than an org-level Actions variable: pleme-io is on the GitHub Free org
+    # plan, which does not share org vars/secrets into private repos'
+    # workflow-evaluation context, so a vars.*-based fallback silently
+    # resolves empty there. Same idiom as rust-auto-release.yml/
+    # python-auto-release.yml.
+    runs-on: ${{ inputs.runner != '' && inputs.runner || (github.event.repository.private && 'camelot-builder-pleme-eks' || 'ubuntu-24.04') }}
+    # Never re-trigger on the bot's own pushes (defensive; this workflow does not
+    # itself push commits, but a consumer might add a bump step later).
+    if: github.actor != 'github-actions[bot]'
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+        with:
+          github-token: ${{ secrets.BOT_PAT }}
+
+      # Token-resolution overlay: BOT_PAT > GHCR_TOKEN > GITHUB_TOKEN lives
+      # ONCE in the registry-login action (client: helm → helm's own registry
+      # config store, which the .#release / .#mirror steps below consult).
+      - name: Registry login
+        uses: pleme-io/actions/registry-login@main
+        with:
+          registry: ${{ inputs.registry }}
+          client: helm
+          username: ${{ github.actor }}
+          bot-pat: ${{ secrets.BOT_PAT }}
+          ghcr-token: ${{ secrets.GHCR_TOKEN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # Hermetic supply chain (the law): mirror every third-party subchart this
+      # monorepo depends on into the pleme-io OCI registry FIRST, so the release
+      # fetches every subchart dep from ghcr (which we control), never from a
+      # third-party *.github.io repo. `forge helm mirror` derives everything from
+      # the wrapper charts' own Chart.yaml deps — no catalog. Idempotent: a
+      # (name,version) already in ghcr is skipped (a normal run is just N
+      # existence checks); only a freshly-bumped upstream version touches the
+      # upstream. A clean no-op for a repo with no third-party subchart deps.
+      # (The released `pleme-io/actions/helm-mirror` action is the same `forge
+      # helm mirror` for standalone use; here we invoke the consumer's pinned
+      # forge directly via its `.#mirror` flake app.)
+      #
+      # `continue-on-error` here + the trailing "Fail if mirroring failed" step
+      # below is deliberate: forge's `mirror` already runs every dependency to
+      # completion and only bails at the end (aggregated, listing every
+      # failure) — but a single stuck dependency (e.g. a brand-new GHCR package
+      # name hitting a one-time `403 write_package` permission gap) must not
+      # skip the "Publish all bumped charts" step that follows. Without this,
+      # ONE upstream mirror failure would silently abort publishing every
+      # already-bumped chart in the batch, not just the one that's stuck.
+      - name: Mirror upstream subcharts
+        id: mirror
+        continue-on-error: true
+        env:
+          REGISTRY: ${{ inputs.registry }}
+        run: nix run ".#mirror" -- "$REGISTRY"
+
+      - name: Publish all bumped charts (idempotent — skips already-published)
+        env:
+          REGISTRY: ${{ inputs.registry }}
+          RELEASE_APP: ${{ inputs.release-app }}
+        run: |
+          set -euo pipefail
+          nix run ".#${RELEASE_APP}" -- "$REGISTRY"
+
+      # Surface the mirror failure as a job failure — AFTER publish already ran
+      # — so the gap stays visible (someone must grant the one-time GHCR
+      # package-creation permission for the new package) without having
+      # blocked the charts that were ready to ship.
+      - name: Fail the job if any upstream mirror failed
+        if: steps.mirror.outcome == 'failure'
+        run: |
+          echo "::error::Mirror step failed for one or more upstream subcharts (see 'Mirror upstream subcharts' log above). Charts that were ready still published in the step above. If a failure is '403 write_package' on a brand-new package name, it needs a one-time manual GHCR package-creation permission grant — this is not something the workflow can self-heal."
+          exit 1

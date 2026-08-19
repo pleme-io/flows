@@ -1,0 +1,457 @@
+# vendor-image-mirror.yml — pull a THIRD-PARTY (unmodified, un-rebuilt)
+# image, gate it through the fleet's zero-tolerance CVE scan, and mirror
+# it into Zot only if it passes.
+#
+# Distinct from nix-image-auto-release.yml (which builds + pushes a
+# pleme-io-OWNED image, e.g. a Nix rebuild of an upstream base) and from
+# the hardened-images program generally: this workflow never rebuilds
+# anything. It exists for the class of image Camelot runs unmodified from
+# an upstream registry (FluxCD, Istio, cloudnative-pg, external-secrets,
+# AWS EKS system images, the ARC controller, metrics-server) that has
+# never been through any pleme-io CVE gate at all, closing that visibility
+# gap without pretending to rebuild every third-party controller
+# ourselves. Composes two already-shipped primitives -- zot-pull-scan
+# (pull + scan + admit/reject) and oci-image-push (skopeo push of a local
+# archive) -- rather than re-implementing either.
+#
+# Since 2026-07-24 the optional `source-registry` / `SOURCE_PASSWORD`
+# inputs also let this mirror an ALREADY-built PRIVATE pleme-io image --
+# e.g. a hardened-* rebuild that image-release.yml already published to
+# private GHCR -- into Zot. The pull+scan+mirror shape is identical; only
+# the source now needs authentication. Left empty (the default), every
+# existing public-source vendor-* leg is entirely unchanged.
+#
+# Zot is cluster-internal-only (zot-pleme-zot.zot.svc.cluster.local),
+# unreachable from a GitHub-hosted runner -- every job here runs on
+# Camelot's own ARC pool (camelot-builder-pleme-eks, in the camelot-ci
+# namespace, already inside Zot's authz.repositories `allowedClientNamespaces`
+# per the Zot HelmRelease values in the cluster's own GitOps repo), never
+# ubuntu-latest. No private/public repo routing needed here (unlike
+# nix-image-auto-release.yml's runner-resolve split) -- reachability is
+# about the runner's network position, not the caller repo's visibility.
+
+name: vendor-image-mirror
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: "Full vendor image ref to pull + scan (e.g. ghcr.io/fluxcd/helm-controller:v1.6.2)"
+        type: string
+        required: true
+      zot-registry:
+        description: "Zot's cluster-internal host:port"
+        type: string
+        default: "zot-pleme-zot.zot.svc.cluster.local:5000"
+      zot-repo:
+        description: "Destination repository name in Zot (e.g. vendor-fluxcd-helm-controller)"
+        type: string
+        required: true
+      zot-tag:
+        description: "Destination tag in Zot -- keep the upstream version string so drift is visible (e.g. v1.6.2)"
+        type: string
+        required: true
+      fail-on-severity:
+        description: "Lowest severity that rejects admission. UNKNOWN = zero-tolerance, matching every other faucet gate in the fleet."
+        type: string
+        default: "UNKNOWN"
+      ignore-file:
+        description: "Path (relative to repo root) to a .trivyignore-format file of named, tracked exceptions. Empty = none. Requires the caller repo to be checked out, which this workflow now does when this or `vex` is set."
+        type: string
+        default: ""
+      vex:
+        description: >-
+          Path (relative to the CALLER's repo root) to an OpenVEX/CSAF document,
+          forwarded to zot-pull-scan -> image-scan -> trivy --vex. Set this
+          whenever the image's PUBLISHING gate passed because of a VEX
+          statement: this faucet re-scans the pulled bytes, so without the same
+          document it reaches the opposite verdict and the image can never enter
+          Zot -- and therefore can never reach the downstream environment.
+          Measured 2026-07-31 (run
+          30661312791): hardened-chproxy released green with its GO-2026-5932
+          OpenVEX doc and its mirror failed "zot faucet REJECT ... severity=UNKNOWN".
+          Empty = no VEX, unchanged for every existing vendor-* caller.
+        type: string
+        default: ""
+      runner:
+        description: "Explicit runner label override. Empty = camelot-builder-pleme-eks (Zot is cluster-internal; there is no public-repo fallback for this workflow)."
+        type: string
+        default: ""
+      ca-cert-url:
+        description: >-
+          FALLBACK ONLY. Raw URL of the committed zot-ca.crt PEM, used with the
+          CA_CERT_TOKEN secret when the org variable CAMELOT_ZOT_CA is unset.
+          Empty by default: this workflow is public and must not carry a
+          consumer's private GitOps path as a constant.
+        type: string
+        default: ""
+      zot-username:
+        description: "Zot push credential username -- not confidential (a fixed, per-repository-scoped admin user, see release.yaml's authz.repositories), so a plain input rather than a secret."
+        type: string
+        default: "akeyless-builder"
+      source-registry:
+        description: "Registry host to authenticate skopeo against BEFORE the source pull -- for a PRIVATE source (e.g. ghcr.io for a private pleme-io/hardened-* package). Empty (default) = no source login, the original public-source behavior (every existing vendor-* leg pulls a PUBLIC upstream image, so this is a no-op for them)."
+        type: string
+        default: ""
+      source-username:
+        description: "Username for the source-registry login (default the workflow actor). Ignored when source-registry is empty."
+        type: string
+        default: "${{ github.actor }}"
+    secrets:
+      ZOT_PASSWORD:
+        # required:false, deliberately — this is the same defect
+        # cargo-auto-release.yml already documents. GitHub validates the WHOLE
+        # reusable call graph at STARTUP, before any job `if:` is evaluated, so
+        # `required: true` fails the caller with zero jobs and no step output.
+        # On GitHub Free an ORG secret reaches PUBLIC repos only, so every
+        # PRIVATE caller's `secrets: inherit` passes nothing here and trips it
+        # — measured 2026-08-08 on pleme-io/caixa-url:
+        #   Error when evaluating 'secrets'. Secret ZOT_PASSWORD is required,
+        #   but not provided while calling.
+        # A startup failure names no repo and runs no step, which reads as
+        # "autorelease is broken". Absence is caught at USE time instead, where
+        # the error can name the secret and the repo missing it.
+        description: "Zot push credential password"
+        required: false
+      SOURCE_PASSWORD:
+        description: "Password/token for source-registry (e.g. a GHCR read:packages PAT) -- only needed when the SOURCE image is private. Optional: absent keeps the public-source path unchanged."
+        required: false
+      CA_CERT_TOKEN:
+        description: "Read access to the private GitOps repo named by the `ca-cert-url` input, whose committed zot-ca.crt this workflow trusts. Only consulted when the org variable CAMELOT_ZOT_CA is unset. Optional so the ~14 existing vendor-* callers keep working unchanged -- but WITHOUT it the CA fetch fails LOUDLY rather than installing GitHub's 404 body as a certificate."
+        required: false
+    outputs:
+      admitted:
+        description: "'true' iff the pulled image cleared the CVE gate and was mirrored into Zot"
+        value: ${{ jobs.mirror.outputs.admitted }}
+      severity:
+        description: "Highest severity found, as classified by image-scan"
+        value: ${{ jobs.mirror.outputs.severity }}
+      result:
+        description: "'admitted' | 'rejected' | 'pull-failed'"
+        value: ${{ jobs.mirror.outputs.result }}
+      zot-digest:
+        description: >-
+          The digest Zot actually serves for the mirrored tag, read back AFTER
+          the push. Empty when the readback did not run or could not resolve --
+          an honest empty, never a synthesised value.
+
+          DECLARED HERE, not just on the job. A job-level `outputs:` entry does
+          NOT cross the workflow_call boundary; only this block does. Without it
+          the caller reads "" while the job log plainly shows `Set output
+          'zot-digest'` -- which is exactly what happened on hardened-images run
+          30669854126, where the digest was resolved correctly
+          (sha256:6e891d92...) and the consuming promote job still received
+          nothing, then failed on the empty value.
+
+          This is the identical defect pleme-io/actions/doca's own outputs block
+          warns about one layer down: "a composite action must DECLARE them or
+          they stop at the action boundary and the caller sees nothing." Same
+          shape, same silence, one level up.
+        value: ${{ jobs.mirror.outputs.zot-digest }}
+
+permissions:
+  contents: read
+  # For the optional private-SOURCE pull below: lets the GITHUB_TOKEN
+  # fallback read a private pleme-io GHCR package when no explicit
+  # SOURCE_PASSWORD PAT is supplied. Additive + harmless for every existing
+  # public-source vendor-* leg (they never authenticate the source at all).
+  packages: read
+
+jobs:
+  mirror:
+    name: pull + scan + mirror ${{ inputs.zot-repo }}:${{ inputs.zot-tag }}
+    runs-on: ${{ inputs.runner != '' && inputs.runner || 'camelot-builder-pleme-eks' }}
+    outputs:
+      # ── `admitted` NOW MEANS WHAT ITS NAME SAYS, and it did not before ──────
+      # This was `steps.pull-scan.outputs.admitted` alone -- i.e. "cleared the
+      # CVE gate", computed BEFORE the push, while this workflow's own docstring
+      # promised "cleared the CVE gate AND was mirrored into Zot". The seven
+      # downstream promote jobs in hardened-images gate on exactly this value.
+      #
+      # The hole that opens: a push that returns 0 without writing is
+      # indistinguishable from a real mirror. Nothing anywhere read Zot back, so
+      # "the artifact is in Zot" was inferred from an exit code rather than
+      # observed. Zot is the gate the whole flow rests on -- nothing may be
+      # promoted downstream before it is really in Zot -- so this is the one
+      # place an unverified success is least affordable.
+      #
+      # Now it is the CONJUNCTION of the scan verdict and a readback that proves
+      # the bytes are retrievable from Zot by the tag the consumer will resolve. Reading
+      # the destination is the only evidence that distinguishes "pushed" from
+      # "push reported success".
+      admitted: ${{ steps.pull-scan.outputs.admitted == 'true' && steps.zot-readback.outcome == 'success' }}
+      severity: ${{ steps.pull-scan.outputs.severity }}
+      result: ${{ steps.pull-scan.outputs.result }}
+      # The digest Zot actually serves. Empty when the readback did not run or
+      # could not resolve -- an honest empty, never a synthesised value.
+      zot-digest: ${{ steps.zot-readback.outputs.digest }}
+    steps:
+      # ── Stage 0 REMOVED 2026-07-31: the source login was a step that could
+      # only ever skip. ────────────────────────────────────────────────────────
+      #
+      # It was `uses: pleme-io/actions/skopeo-login`, gated on
+      # `inputs.source-registry != ''`, writing skopeo's authfile for stage 1 to
+      # pick up ambiently. Every hardened-images mirror leg failed on it for
+      # days with:
+      #
+      #   oci-push: pull failed for 'ghcr.io/pleme-io/hardened-chproxy:1.0.53':
+      #     Not authorized: url https://ghcr.io/v2/.../manifests/1.0.53
+      #
+      # THE CALLER NEVER PASSED `source-registry`. It passed ref/zot-repo/zot-tag
+      # and nothing else, so the condition was false, the login SKIPPED, and the
+      # pull ran anonymous against a private package. A skipped step is green.
+      # Nothing anywhere said "this image needs credentials and has none" — the
+      # only symptom was a generic 401 two steps later, attributed for two
+      # rounds to the puller rather than to a login that never ran.
+      #
+      # That is the failure-indistinguishable-from-success shape: an `if:` on an
+      # input the caller doesn't know to set fails OPEN and reports success.
+      #
+      # THE FIX IS NOT TO RESTORE THE LOGIN. Credentials now go to the puller
+      # EXPLICITLY, as typed inputs (below) rather than through a shared file
+      # one step writes and another hopes to find. Explicit beats ambient here
+      # for a reason worth stating: with `src-user`/`src-pass` the pull either
+      # has credentials or provably does not, and doca reports which — whereas
+      # an authfile handshake has a silent third state, "written somewhere the
+      # reader doesn't look", which is precisely what stage 1 becoming doca
+      # rather than skopeo would have introduced the moment anyone DID set
+      # source-registry. Deleting this step closes the live bug and forecloses
+      # that one.
+      #
+      # It also retires a skopeo call site, per the fleet-wide doca conversion.
+      # doca does read ~/.config/containers/auth.json (verified in
+      # credential_store_paths), so this is a swap for the better mechanism, not
+      # a workaround for a missing one.
+      #
+      # The `source-registry` / `source-username` / `SOURCE_PASSWORD` inputs are
+      # KEPT and still mean exactly what they meant — empty leaves every
+      # public-source vendor-* leg on the anonymous path, unchanged.
+
+      # Stage 1+2: pull the vendor image + gate it through the fleet's one
+      # canonical Trivy severity implementation. Scans the PULLED bytes,
+      # never a re-resolved tag -- see zot-pull-scan's own README for why
+      # that distinction is load-bearing.
+      # @main, not @v1 -- zot-pull-scan was added 2026-06+, months after
+      # v1 was tagged (2026-05-22); the whole action directory doesn't
+      # exist at that ref at all ("Can't find 'action.yml' ... for action
+      # 'pleme-io/actions/zot-pull-scan@v1'", confirmed live 2026-07-21 --
+      # same stale-tag bug class as tatara-script@v1 elsewhere this
+      # session, this time the action doesn't exist at the tag rather
+      # than just missing an output). The action's own README shows @v1
+      # as its usage example -- also stale, fixed alongside this.
+      # A file path input is only meaningful if the file is on the runner. This
+      # workflow had NO checkout, so `ignore-file` -- declared since it was
+      # written -- pointed at a path that could not exist. It was never caught
+      # because no caller ever passed it (measured 2026-07-31: zero callers).
+      # `vex` has real callers from day one, so the checkout is now required
+      # rather than latent. Conditional so the ~14 public vendor-* legs, which
+      # pass neither, keep their exact current step list.
+      - name: Check out the caller's repo (only when a scan file is passed)
+        if: inputs.vex != '' || inputs.ignore-file != ''
+        uses: actions/checkout@v4
+
+      - id: pull-scan
+        uses: pleme-io/actions/zot-pull-scan@main
+        with:
+          ref: ${{ inputs.ref }}
+          fail-on-severity: ${{ inputs.fail-on-severity }}
+          ignore-file: ${{ inputs.ignore-file }}
+          vex: ${{ inputs.vex }}
+          # Explicit source credentials, replacing the deleted stage-0 login.
+          # Still gated on source-registry, so an empty one (every public
+          # vendor-* leg) passes empty strings and doca keeps the anonymous
+          # path -- identical behavior to before for those callers. What
+          # changed is that a caller which DOES declare a private source now
+          # gets its credentials handed to the puller directly instead of left
+          # in a file the puller may or may not read.
+          src-user: ${{ inputs.source-registry != '' && inputs.source-username || '' }}
+          src-pass: ${{ inputs.source-registry != '' && (secrets.SOURCE_PASSWORD || secrets.GITHUB_TOKEN) || '' }}
+
+      # A rejected or pull-failed image is a genuinely informative CI
+      # failure (the severity + vuln-count are already in the job
+      # summary via zot-pull-scan's own outputs) -- never silently
+      # continue past a non-admitted verdict.
+      # `always() &&` is load-bearing: without it this step NEVER RUNS.
+      # `pull-scan` carries no continue-on-error, so verdict.tlisp's exit 1
+      # fails the step and GitHub skips every later step by default -- measured
+      # on run 30661312791, where this step's conclusion was `skipped` on a real
+      # rejection. So the one step whose entire job is to explain WHY an image
+      # was refused was dead code on exactly the path it exists for, and a
+      # rejection surfaced as a bare composite failure with no severity and no
+      # vuln-count. A diagnostic that cannot run during the failure it describes
+      # is not a diagnostic.
+      - name: Report non-admission
+        if: always() && steps.pull-scan.outputs.admitted != 'true'
+        run: |
+          echo "::error::vendor-image-mirror: ${{ inputs.ref }} was NOT admitted (result=${{ steps.pull-scan.outputs.result }}, severity=${{ steps.pull-scan.outputs.severity }}, vuln-count=${{ steps.pull-scan.outputs.vuln-count }}) -- refusing to mirror into Zot."
+          exit 1
+
+      # Zot serves a self-signed cert (tls.mode: inPod, 825-day validity --
+      # see the Zot HelmRelease values in the cluster's own GitOps repo). The
+      # zot-ca.crt committed alongside those values is meant
+      # for exactly this: pin against a SPECIFIC known cert via the
+      # runner's system trust store, never `--tls-verify=false`. Once
+      # trusted here, skopeo (both this step's login and oci-image-push's
+      # own copy below) verifies natively -- no extra flag needed on
+      # either.
+      # ── This step installed "404: Not Found" AS A CERTIFICATE for 5 days ──
+      #
+      # It fetched the CA from the cluster's GitOps repo -- a PRIVATE repo -- with
+      # `curl -sL` and no token. GitHub answers an unauthenticated raw request
+      # for a private path with HTTP 404 and a 14-byte body. Measured:
+      #
+      #     curl -sL  <url>  ->  body "404: Not Found",  exit 0
+      #     curl -fsL <url>  ->  no body,                exit 22
+      #
+      # Without `-f`, curl treats the 404 as a successful transfer. Those 14
+      # bytes were copied into /usr/local/share/ca-certificates/, and
+      # `update-ca-certificates` then printed "1 added, 0 removed; done." and
+      # exited 0 -- because it counts FILES, not valid certificates. The step
+      # reported SUCCESS having trusted nothing, and every subsequent skopeo
+      # call died on Zot's self-signed TLS.
+      #
+      # A guard that cannot fail is not a guard. Three changes, most
+      # load-bearing first:
+      #
+      #   1. `-f` -- the fetch FAILS the job instead of laundering an error
+      #      page into a certificate. Unconditional, and on its own it turns a
+      #      silent 5-day outage into an immediate red run.
+      #   2. a PEM-header check -- even a 200 carrying the wrong bytes cannot
+      #      be installed. This is what makes "we trusted something that is
+      #      not a certificate" unconstructible rather than merely unlikely.
+      #   3. an optional CA_CERT_TOKEN -- the actual auth, matching the seam
+      #      pleme-io/actions/zot-push already exposes. substrate's inline
+      #      curl was the only zot-CA fetch in the fleet missing BOTH.
+      #   4. the URL is an INPUT, not a constant. A reusable workflow in a
+      #      public repo must not carry a consumer's private GitOps path, and
+      #      the preferred org-variable path below needs no URL at all.
+      #
+      # Why it ever worked: zot-push's own comment calls this cert "public,
+      # safe to fetch" -- that GitOps repo used to be public. The repo going
+      # private broke it silently, because nothing on this path checked.
+      - name: Trust Zot's CA
+        if: steps.pull-scan.outputs.admitted == 'true'
+        env:
+          # PREFERRED: the CA as an org Actions variable — no network, no auth,
+          # no private repo, cannot 404.
+          #
+          # The GitOps repo holding it is private PERMANENTLY (operator
+          # decision, 2026-07-28), so authenticating the fetch would mean
+          # distributing a cross-repo PAT to every mirror job forever. That is
+          # the wrong shape
+          # for this asset: the file is a self-signed CA *public* certificate
+          # (verified: 1992 bytes, one PEM CERTIFICATE block, zero PRIVATE KEY
+          # blocks, CN=zot-pleme-zot.zot.svc.cluster.local, valid to 2028-10-20).
+          # A CA cert is the thing you DISTRIBUTE so clients can verify the
+          # server; the private key never leaves the cluster. Needing a secret
+          # to read a public certificate was accidental coupling to where it
+          # happened to be stored.
+          #
+          # `vars` in a called workflow resolves against the CALLER's org, and
+          # every caller is pleme-io, so this needs NO per-caller wiring — it
+          # works for the ~14 existing vendor-* legs and every future one.
+          # Matches the org's existing pattern (CAMELOT_IMAGE_RUNNER,
+          # CAMELOT_SUI_SUBSTITUTER).
+          ZOT_CA_PEM: ${{ vars.CAMELOT_ZOT_CA }}
+          # FALLBACK only: a token for the private-repo fetch, for a caller
+          # outside pleme-io where the org variable does not resolve.
+          CA_CERT_TOKEN: ${{ secrets.CA_CERT_TOKEN }}
+          CA_CERT_URL: ${{ inputs.ca-cert-url }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "${ZOT_CA_PEM:-}" ]; then
+            printf '%s\n' "$ZOT_CA_PEM" > /tmp/zot-ca.crt
+            echo "CA source: org variable CAMELOT_ZOT_CA (no network)"
+          elif [ -n "${CA_CERT_TOKEN:-}" ] && [ -n "${CA_CERT_URL:-}" ]; then
+            curl -fsSL -H "Authorization: Bearer $CA_CERT_TOKEN" -o /tmp/zot-ca.crt "$CA_CERT_URL"
+            echo "CA source: authenticated fetch from ca-cert-url"
+          else
+            echo "::error::No CA available. Set the org variable CAMELOT_ZOT_CA (preferred),"
+            echo "::error::or pass BOTH the ca-cert-url input and the CA_CERT_TOKEN secret."
+            echo "::error::The source repo is PRIVATE — an unauthenticated fetch returns a"
+            echo "::error::14-byte '404: Not Found' body, which is what this step used to"
+            echo "::error::install as a certificate."
+            exit 1
+          fi
+
+          if ! grep -q "BEGIN CERTIFICATE" /tmp/zot-ca.crt; then
+            echo "::error::Fetched CA is not a PEM certificate ($(wc -c < /tmp/zot-ca.crt) bytes)."
+            echo "::error::First bytes: $(head -c 120 /tmp/zot-ca.crt)"
+            echo "::error::Set the org variable CAMELOT_ZOT_CA to the PEM (preferred), or pass ca-cert-url + CA_CERT_TOKEN."
+            exit 1
+          fi
+
+          sudo cp /tmp/zot-ca.crt /usr/local/share/ca-certificates/zot-cluster-ca.crt
+          sudo update-ca-certificates
+
+      # ── The Zot skopeo-login is GONE, and its replacement is not a login ────
+      #
+      # oci-image-push now pushes with doca, which takes credentials as
+      # arguments. So the credential no longer travels through an authfile that
+      # one step writes and another must find -- the same ambient-handshake
+      # shape that made the source-side failure so hard to read.
+      #
+      # ca-cert is REQUIRED here and is the subtle part. Zot serves a
+      # self-signed cert; skopeo honoured the system trust store, so the "Trust
+      # Zot's CA" step above was sufficient for it. doca CANNOT use that store:
+      # its oci-client is built with `rustls-tls`, whose trust anchors are the
+      # COMPILED-IN webpki set (`rustls-native-certs` is not in the lock) --
+      # doca's own source states this. Passing the PEM path is what actually
+      # establishes trust for the push.
+      #
+      # Without this the conversion would have failed TLS at the push with the
+      # step named "Trust Zot's CA" sitting GREEN directly above it: a
+      # preparation step that succeeds while preparing nothing for the tool that
+      # follows it. The CA step is kept -- it is still the thing that fetches and
+      # validates the PEM, and other tooling on the runner does read the system
+      # store.
+      #
+      # oci-image-push is composite (runs natively on this runner, not a
+      # Docker-mode container) -- the same fix already shipped for the
+      # customer-facing Harbor pipeline (pleme-io/actions@d1b51db) applies
+      # here identically: a local docker-archive path only resolves
+      # correctly off the runner's own filesystem.
+      - name: Mirror into Zot
+        if: steps.pull-scan.outputs.admitted == 'true'
+        uses: pleme-io/actions/oci-image-push@main
+        with:
+          registry: ${{ inputs.zot-registry }}
+          image: ${{ inputs.zot-repo }}
+          tag: ${{ inputs.zot-tag }}
+          tarball: ${{ steps.pull-scan.outputs.local-archive }}
+          username: ${{ inputs.zot-username }}
+          password: ${{ secrets.ZOT_PASSWORD }}
+          ca-cert: /tmp/zot-ca.crt
+
+      # ── READ THE DESTINATION BACK. This is the step that makes `admitted`
+      # honest, and it is deliberately NOT continue-on-error. ─────────────────
+      #
+      # A push exit code says the client believed it succeeded. It does not say
+      # the registry serves the bytes. Those differ on a silently-rejected
+      # layer, a namespace the credential cannot actually write, a proxy that
+      # swallowed the PUT, or a tag that resolves to something else. Every one
+      # of those renders as a green mirror and a downstream promotion of an
+      # artifact Zot does not have.
+      #
+      # Resolving the tag to a digest THROUGH Zot, with the same CA and
+      # credential a consumer would use, is the cheapest evidence that the
+      # artifact is really there and really addressable by the tag the consumer resolves.
+      # Failing here fails the job, which is correct: a mirror that cannot be
+      # read back has not mirrored, and must not be reported as admitted.
+      - name: Verify the artifact is really IN Zot (readback)
+        id: zot-readback
+        if: steps.pull-scan.outputs.admitted == 'true'
+        uses: pleme-io/actions/doca@main
+        with:
+          operation: inspect
+          ref: "${{ inputs.zot-registry }}/${{ inputs.zot-repo }}:${{ inputs.zot-tag }}"
+          user: ${{ inputs.zot-username }}
+          pass: ${{ secrets.ZOT_PASSWORD }}
+          dest-ca-cert: /tmp/zot-ca.crt
+          digest-only: "true"
+
+      - name: Mirror verified
+        if: steps.zot-readback.outcome == 'success'
+        run: |
+          echo "::notice::Zot serves ${{ inputs.zot-repo }}:${{ inputs.zot-tag }} at digest ${{ steps.zot-readback.outputs.digest }} -- readback confirmed, not inferred from an exit code."

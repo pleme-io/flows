@@ -1,0 +1,263 @@
+name: pleme
+
+# THE UNIVERSAL COMPOSER — one entry point over the whole catalogued surface.
+#
+#     jobs:
+#       pleme:
+#         uses: pleme-io/substrate/.github/workflows/pleme.yml@main
+#         with:
+#           family: rust
+#           target: cargo-auto-release
+#         secrets: inherit
+#
+# REACH: 72 of the 73 catalogued reusables (everything except this file) —
+# 63 flat leaves through ten tier-2 family composers, plus the 9 that nest,
+# dispatched directly here.
+#
+# ── THE STRUCTURE IS THE PLATFORM'S, MEASURED ────────────────────────────
+#
+# Two GitHub limits shape this, and both were measured rather than assumed:
+#
+#   1. A workflow may contain at most 20 `uses:` calls. One file therefore
+#      cannot dispatch to 73 leaves — hence tier 2.
+#   2. A chain may be at most 4 workflows, so
+#         consumer(1) -> pleme(2) -> pleme-rust(3) -> leaf(4)
+#      is exactly legal — but ONLY while the leaf calls no reusable itself.
+#
+# Limit 2 is why the split is by NESTING rather than by taste. Nine reusables
+# call reusables of their own — cargo-ci, pre-merge-gate, cargo-release,
+# helm-chart-release, auto-release, auto-release-min, release-pipeline,
+# pleme-stack, super-cache-ci-build-matrix. Routing any of them through a
+# tier-2 composer would make the chain 5 and the run would refuse to start, so
+# they are dispatched DIRECTLY below. That asymmetry is not a wart; it is the
+# shape the 4-level cap forces once some leaves are themselves composites.
+#
+# An earlier cut of this file claimed a second tier was impossible outright.
+# That was wrong, and wrong in a specific way worth remembering: it
+# generalised "cargo-ci nests, so its chain is full" into "no tier-2 is
+# possible", when 63 of the 73 leaves are flat and admit one perfectly well.
+# The limit was mine, not GitHub's.
+#
+# ── WHAT THIS FILE MUST NEVER BECOME ─────────────────────────────────────
+#
+# A dispatcher, not an implementation. Every arm delegates to something already
+# in catalog/workflows.lisp. Behaviour added here rather than in the workflow
+# it fronts is invisible, because a dispatcher is the file nobody opens.
+#
+# HONEST STATUS: 0 consumers. Every leaf it reaches has real adoption (362,
+# 337, 166, 164, …) but this composition has never run. The fleet already
+# carries 34 zero-consumer reusables; do not cite this as load-bearing until
+# something calls it.
+
+on:
+  workflow_call:
+    inputs:
+      family:
+        description: >-
+          Which part of the catalogue to dispatch into.
+
+            rust ruby go ansible caixa iac helm container publish ops
+              -> a tier-2 family composer; `target` names the reusable
+
+            direct
+              -> one of the 9 nesting reusables, named by `target`:
+                 cargo-ci, pre-merge-gate, cargo-release, helm-chart-release,
+                 auto-release, auto-release-min, release-pipeline,
+                 pleme-stack, super-cache-ci-build-matrix
+        required: true
+        type: string
+      target:
+        description: "The reusable to run within that family."
+        required: true
+        type: string
+      runner:
+        required: false
+        type: string
+        default: ""
+
+jobs:
+  # An unknown family or target must FAIL, not silently run nothing. Every arm
+  # is `if:`-gated, so a typo would otherwise skip all of them and report a
+  # green run that did no work — the same green-over-nothing shape as the
+  # `dep-missing` defer fixed elsewhere in this fleet today.
+  validate:
+    name: "family + target are known"
+    # The fallback used to be a bare 'ubuntu-latest', which on a PRIVATE caller
+    # is a metered runner — the same defect fixed across 31 reusables on
+    # 2026-08-08, surviving here because this line is an EXPRESSION and the
+    # sweep matched bare literals only. Receipt: pleme-io/tend's gen-spec ran
+    # on `ubuntu-latest` with 0 steps (blocked) hours after the fleet "was
+    # routed". An explicit `inputs.runner` still wins, so a caller that needs
+    # a specific label is unaffected.
+    runs-on: ${{ inputs.runner != '' && inputs.runner || (github.event.repository.private && 'camelot-builder-pleme-eks' || 'ubuntu-latest') }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pleme-io/actions/tatara-script@main
+        with:
+          script: |
+            (define families
+              (list "rust" "ruby" "go" "ansible" "caixa" "iac" "helm" "container"
+                    "publish" "ops" "direct"))
+            (define direct-targets
+              (list "cargo-ci" "pre-merge-gate" "cargo-release" "helm-chart-release"
+                    "auto-release" "auto-release-min" "release-pipeline" "pleme-stack"
+                    "super-cache-ci-build-matrix"))
+            (define f (env-get "FAMILY" ""))
+            (define t (env-get "TARGET" ""))
+            (cond
+              ((not (member? f families))
+                (log-error
+                  (string-append "unknown family '" f "' — known: " (string-join ", " families)))
+                (exit 1))
+              ((equal? t "") (log-error "target is required") (exit 1))
+              ;; A `direct` target must be one of the nine that nest. Naming a
+              ;; flat leaf here would skip every arm and go green having done
+              ;; nothing — exactly what this job exists to stop.
+              ((and (equal? f "direct") (not (member? t direct-targets)))
+                (log-error
+                  (string-append
+                    "'" t "' is not one of the 9 nesting reusables. Flat leaves go through "
+                    "their family composer instead — see catalog/workflows.lisp. Known: "
+                    (string-join ", " direct-targets)))
+                (exit 1))
+              ;; For a family target, confirm the tier-2 composer actually names
+              ;; it. A wrong name would skip that composer's arms and report
+              ;; success having run nothing.
+              ((and (not (equal? f "direct"))
+                    (not
+                      (string-contains?
+                        (read-file (string-append ".github/workflows/pleme-" f ".yml"))
+                        (string-append "inputs.target == '" t "'"))))
+                (log-error
+                  (string-append "'" t "' is not a target of the '" f "' family composer"))
+                (exit 1))
+              (else (log-info (string-append "family=" f " target=" t)) (exit 0)))
+        env:
+          FAMILY: ${{ inputs.family }}
+          TARGET: ${{ inputs.target }}
+
+  # ── tier 2: the 63 flat leaves, by family ────────────────────────────
+  rust:
+    needs: validate
+    if: inputs.family == 'rust'
+    uses: ./.github/workflows/pleme-rust.yml
+    with: { target: "${{ inputs.target }}" }
+    secrets: inherit
+
+  ruby:
+    needs: validate
+    if: inputs.family == 'ruby'
+    uses: ./.github/workflows/pleme-ruby.yml
+    with: { target: "${{ inputs.target }}" }
+    secrets: inherit
+
+  go:
+    needs: validate
+    if: inputs.family == 'go'
+    uses: ./.github/workflows/pleme-go.yml
+    with: { target: "${{ inputs.target }}" }
+    secrets: inherit
+
+  ansible:
+    needs: validate
+    if: inputs.family == 'ansible'
+    uses: ./.github/workflows/pleme-ansible.yml
+    with: { target: "${{ inputs.target }}" }
+    secrets: inherit
+
+  caixa:
+    needs: validate
+    if: inputs.family == 'caixa'
+    uses: ./.github/workflows/pleme-caixa.yml
+    with: { target: "${{ inputs.target }}" }
+    secrets: inherit
+
+  iac:
+    needs: validate
+    if: inputs.family == 'iac'
+    uses: ./.github/workflows/pleme-iac.yml
+    with: { target: "${{ inputs.target }}" }
+    secrets: inherit
+
+  helm:
+    needs: validate
+    if: inputs.family == 'helm'
+    uses: ./.github/workflows/pleme-helm.yml
+    with: { target: "${{ inputs.target }}" }
+    secrets: inherit
+
+  container:
+    needs: validate
+    if: inputs.family == 'container'
+    uses: ./.github/workflows/pleme-container.yml
+    with: { target: "${{ inputs.target }}" }
+    secrets: inherit
+
+  publish:
+    needs: validate
+    if: inputs.family == 'publish'
+    uses: ./.github/workflows/pleme-publish.yml
+    with: { target: "${{ inputs.target }}" }
+    secrets: inherit
+
+  ops:
+    needs: validate
+    if: inputs.family == 'ops'
+    uses: ./.github/workflows/pleme-ops.yml
+    with: { target: "${{ inputs.target }}" }
+    secrets: inherit
+
+  # ── the 9 that nest: dispatched DIRECTLY, or the chain would be 5 ────
+  direct-cargo-ci:
+    needs: validate
+    if: inputs.family == 'direct' && inputs.target == 'cargo-ci'
+    uses: ./.github/workflows/cargo-ci.yml
+    secrets: inherit
+
+  direct-pre-merge-gate:
+    needs: validate
+    if: inputs.family == 'direct' && inputs.target == 'pre-merge-gate'
+    uses: ./.github/workflows/pre-merge-gate.yml
+    secrets: inherit
+
+  direct-cargo-release:
+    needs: validate
+    if: inputs.family == 'direct' && inputs.target == 'cargo-release'
+    uses: ./.github/workflows/cargo-release.yml
+    secrets: inherit
+
+  direct-helm-chart-release:
+    needs: validate
+    if: inputs.family == 'direct' && inputs.target == 'helm-chart-release'
+    uses: ./.github/workflows/helm-chart-release.yml
+    secrets: inherit
+
+  direct-auto-release:
+    needs: validate
+    if: inputs.family == 'direct' && inputs.target == 'auto-release'
+    uses: ./.github/workflows/auto-release.yml
+    secrets: inherit
+
+  direct-auto-release-min:
+    needs: validate
+    if: inputs.family == 'direct' && inputs.target == 'auto-release-min'
+    uses: ./.github/workflows/auto-release-min.yml
+    secrets: inherit
+
+  direct-release-pipeline:
+    needs: validate
+    if: inputs.family == 'direct' && inputs.target == 'release-pipeline'
+    uses: ./.github/workflows/release-pipeline.yml
+    secrets: inherit
+
+  direct-pleme-stack:
+    needs: validate
+    if: inputs.family == 'direct' && inputs.target == 'pleme-stack'
+    uses: ./.github/workflows/pleme-stack.yml
+    secrets: inherit
+
+  direct-super-cache-ci-build-matrix:
+    needs: validate
+    if: inputs.family == 'direct' && inputs.target == 'super-cache-ci-build-matrix'
+    uses: ./.github/workflows/super-cache-ci-build-matrix.yml
+    secrets: inherit

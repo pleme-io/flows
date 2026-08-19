@@ -1,0 +1,61 @@
+name: web3-stack
+
+# Composes web3 primitives: test → deploy → notify.
+
+on:
+  workflow_call:
+    inputs:
+      tool:      { type: string, required: false, default: "hardhat" }   # hardhat | foundry | anchor
+      network:   { type: string, required: false, default: "sepolia" }
+      # Runner routing: empty default routes by CALLER repo visibility —
+      # private repos → the pleme-io-org camelot-builder-pleme-eks ARC pool
+      # (avoids billed hosted minutes), public repos → ubuntu-latest. Keyed
+      # off github.event.repository.private (the caller's event payload),
+      # never an org-level Actions variable — pleme-io's GitHub Free org
+      # plan doesn't share org vars/secrets into private repos' workflow
+      # context. Same idiom as rust-auto-release.yml/python-auto-release.yml.
+      runner:    { type: string, required: false, default: "" }
+    secrets:
+      DEPLOYER_PRIVATE_KEY:  { required: false }
+      SLACK_WEBHOOK_URL:     { required: false }
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ${{ inputs.runner != '' && inputs.runner || (github.event.repository.private && 'camelot-builder-pleme-eks' || 'ubuntu-latest') }}
+    steps:
+      - uses: actions/checkout@v4
+      - if: inputs.tool == 'foundry'
+        uses: pleme-io/actions/foundry-test@main
+
+  deploy:
+    needs: test
+    runs-on: ${{ inputs.runner != '' && inputs.runner || (github.event.repository.private && 'camelot-builder-pleme-eks' || 'ubuntu-latest') }}
+    steps:
+      - uses: actions/checkout@v4
+      - if: inputs.tool == 'hardhat'
+        uses: pleme-io/actions/hardhat-deploy@main
+        with:
+          network: ${{ inputs.network }}
+      - if: inputs.tool == 'anchor'
+        uses: pleme-io/actions/anchor-build@main
+
+  notify:
+    needs: deploy
+    # `secrets` is unavailable in job-level `if:` (github/inputs/needs/
+    # vars only) — gate the STEP on a job-env copy instead.
+    if: always()
+    runs-on: ${{ inputs.runner != '' && inputs.runner || (github.event.repository.private && 'camelot-builder-pleme-eks' || 'ubuntu-latest') }}
+    env:
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+    steps:
+      - if: env.SLACK_WEBHOOK_URL != ''
+        uses: pleme-io/actions/slack-notify@main
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          # Quoted: `: ` inside the format() literal breaks unquoted YAML
+          # scalars (same 0-job parse-failure class as observability-deploy).
+          title: "${{ format('web3 deploy: {0}', needs.deploy.result) }}"
+          color: ${{ needs.deploy.result == 'success' && 'good' || 'danger' }}

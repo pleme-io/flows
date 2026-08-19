@@ -1,0 +1,554 @@
+# Reusable workflow: cross-arch Rust binary release.
+#
+#   build (matrix: linux/macOS × x86_64/aarch64)
+#     -> attach binaries + .sha256 to GitHub Release on `v*` tag push
+#     -> (opt-in) also assemble + attach desktop app packages:
+#          macOS  → <AppName>-<version>-macos-<arch>.dmg  (drag-to-Applications)
+#          linux  → <AppName>-<version>-linux-<arch>.tar.gz (.desktop + icon + install.sh)
+#
+# Sibling of rust-release.yml; this one is feature-aware and binary-only
+# (no crates.io publish). Use it when a CLI ships with optional cargo
+# features and consumers need to select which to compile in.
+#
+# Usage (from a consumer repo, .github/workflows/release-binaries.yml):
+#
+#   on:
+#     push:
+#       tags: ['v*']
+#
+#   jobs:
+#     binaries:
+#       uses: pleme-io/substrate/.github/workflows/rust-binary-release.yml@main
+#       with:
+#         binary-name: my-tool
+#         features: "feat-a feat-b"     # optional
+#         no-default-features: true     # optional
+#         system-deps: "libxkbcommon-dev libwayland-dev"  # optional (ubuntu legs)
+#
+# GUI app (opt-in — non-GUI tools are unaffected, app-bundle defaults false):
+#
+#       with:
+#         binary-name: mado
+#         app-bundle: true
+#         app-name: Mado
+#         bundle-id: io.pleme.mado
+#         icon-svg: assets/mado-icon.svg
+#         desktop-categories: "System;TerminalEmulator;"
+#
+# GPU / windowing apps (winit/wgpu): pass `system-deps` the apt
+# packages the linux build needs (e.g. libxkbcommon-dev libwayland-dev
+# libwayland-cursor0 pkg-config). They are apt-get installed on the
+# ubuntu matrix legs BEFORE the build. macOS legs are untouched —
+# Metal ships in the SDK. This is the compounding extension every
+# GPU app reuses.
+#
+# App-bundle packaging reuses the SAME Info.plist keys + iconset slots
+# as substrate's pure-Nix `mkDarwinAppBundle` builder
+# (lib/build/darwin/app-bundle.nix); the only difference is the runner
+# uses the system `rsvg-convert` + `iconutil` (available on GHA macOS
+# runners, unlike the Nix sandbox) instead of resvg + png2icns. The
+# Nix-module path (channel 2) and this CI path (channel 1) therefore
+# produce equivalent `.app` bundles from one icon source of truth.
+
+name: Rust binary release
+
+on:
+  workflow_call:
+    inputs:
+      binary-name:
+        type: string
+        required: true
+        description: "Name of the Cargo binary (used for `target/<triple>/release/<binary-name>`)"
+      features:
+        type: string
+        default: ""
+        description: "Cargo features (space-separated). Empty = no --features flag."
+      no-default-features:
+        type: boolean
+        default: false
+        description: "When true, pass --no-default-features to cargo build"
+      matrix-include:
+        type: string
+        default: ""
+        description: >-
+          JSON array replacing the built-in cross-build matrix. Empty (default)
+          keeps the two libc variants selected by `linux-libc`, so existing
+          callers are unaffected. Each object needs at least os/target/suffix,
+          and MAY carry per-leg `features` / `no-default-features`, which
+          override the workflow-level inputs for that leg only.
+
+          Exists because a cross-build matrix routinely needs different features
+          per target, and the workflow-level inputs apply ONE pair to the whole
+          matrix. pangea-operator forked all 97 lines of this job for exactly
+          that reason (release.yml:403-499); with this input it can call the
+          reusable instead.
+
+          Example:
+            matrix-include: >-
+              [{"os":"ubuntu-latest","target":"aarch64-unknown-linux-gnu",
+                "suffix":"linux-aarch64","no-default-features":true,
+                "features":"graphql grpc executor_magma"}]
+      system-deps:
+        type: string
+        default: ""
+        description: "Space-separated apt packages installed on the ubuntu matrix legs before the build (GPU/windowing libs, e.g. libxkbcommon-dev libwayland-dev). Empty = no apt install. macOS legs unaffected."
+      app-bundle:
+        type: boolean
+        default: false
+        description: "When true, also assemble + attach desktop app packages (macOS .dmg + .app .zip; linux .tar.gz with .desktop + icon + install.sh). Opt-in so non-GUI tools are unaffected."
+      app-name:
+        type: string
+        default: ""
+        description: "Display name for the app bundle (e.g. Mado → Mado.app). Required when app-bundle=true."
+      bundle-id:
+        type: string
+        default: ""
+        description: "CFBundleIdentifier for the macOS .app (e.g. io.pleme.mado). Required when app-bundle=true."
+      icon-svg:
+        type: string
+        default: ""
+        description: "Repo-relative path to the source SVG icon (e.g. assets/mado-icon.svg). Required when app-bundle=true."
+      desktop-categories:
+        type: string
+        default: "Utility;"
+        description: "Linux .desktop Categories= value (e.g. 'System;TerminalEmulator;')."
+      min-system-version:
+        type: string
+        default: "11.0"
+        description: "LSMinimumSystemVersion for the macOS .app Info.plist."
+      linux-libc:
+        type: string
+        default: "gnu"
+        description: >-
+          "gnu" (default) links against the build runner's glibc, so the
+          artifact carries that runner's version as a FLOOR and will not run on
+          an older consumer. "musl" builds fully
+          static linux binaries with no libc floor at all. Prefer musl for a
+          CLI that has to run on arbitrary runners and images; stay on gnu for
+          GUI/GPU apps, which dynamically load wayland/X/GL at runtime and do
+          not work statically linked.
+
+    secrets:
+      # ── PRIVATE GIT DEPENDENCIES ─────────────────────────────────────────
+      # Optional. Supply when the crate's Cargo.toml pulls private pleme-io
+      # git deps (tsunagu, magma, shigoto, shikumi, gen, …). Without it a
+      # cross-build of such a crate fails to authenticate the clone.
+      #
+      # This workflow previously accepted NO secrets at all, which is why
+      # pangea-operator could not call it and forked the whole job instead
+      # (release.yml:408-499): its own header records the incident —
+      # "failed to authenticate when downloading repository ... tsunagu",
+      # and notes the job "likely never actually succeeded with tsunagu in
+      # the dependency graph before, on ANY runner". Per-leg `features` was
+      # only ONE of the two blockers; this was the other.
+      BOT_PAT:
+        required: false
+        description: "PAT with read access to private pleme-io repos. Omit for public-only dependency graphs."
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      # The linux legs build on ubuntu-latest, and the artifact's libc floor is
+      # set by the LINKER (linux-libc), not by the runner. Those are separate
+      # concerns and conflating them is a trap with teeth: an earlier revision
+      # of this file pinned the legs to ubuntu-22.04 to lower the floor, which
+      # broke every linux release outright, because the build step itself runs
+      # `pleme-io/actions/rust-cross-build` — a tatara-script-backed action whose
+      # own binary needs glibc 2.39. The pipeline that produces a 22.04-capable
+      # binary could not run on 22.04. Receipt: tatara-lisp v0.3.36, linux legs
+      # dead with `GLIBC_2.39 not found` before cargo was ever invoked, macOS
+      # legs green.
+      # Use linux-libc: musl for an artifact with no libc floor at all. The
+      # linux-baseline job below stays pinned to 22.04 — it only RUNS the
+      # artifact and uses no tatara-script, so it is free to be the old runner.
+      # ── `matrix-include` overrides this WHOLE list when supplied ─────────
+      # Empty (the default) keeps the two built-in libc variants exactly as
+      # they were, so every existing caller is byte-unaffected. A caller that
+      # needs a different leg set — or per-leg `features` /
+      # `no-default-features` (see the Build step) — passes its own JSON
+      # instead of forking the workflow.
+      matrix:
+        include: ${{ fromJSON(inputs.matrix-include != ''
+          && inputs.matrix-include
+          || (inputs.linux-libc == 'musl'
+          && '[{"os":"ubuntu-latest","target":"x86_64-unknown-linux-musl","suffix":"linux-x86_64"},{"os":"ubuntu-latest","target":"aarch64-unknown-linux-musl","suffix":"linux-aarch64"},{"os":"macos-latest","target":"x86_64-apple-darwin","suffix":"macos-x86_64"},{"os":"macos-latest","target":"aarch64-apple-darwin","suffix":"macos-aarch64"}]'
+          || '[{"os":"ubuntu-latest","target":"x86_64-unknown-linux-gnu","suffix":"linux-x86_64"},{"os":"ubuntu-latest","target":"aarch64-unknown-linux-gnu","suffix":"linux-aarch64"},{"os":"macos-latest","target":"x86_64-apple-darwin","suffix":"macos-x86_64"},{"os":"macos-latest","target":"aarch64-apple-darwin","suffix":"macos-aarch64"}]')) }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # ── Private git-dependency credential ────────────────────────────────
+      # Ported from image-push.yml:321-326, which root-caused this in a live
+      # incident. Two halves, and BOTH are load-bearing:
+      #
+      #   url.insteadOf  — rewrites https://github.com/ to carry the token so
+      #                    cargo can clone a private pleme-io git dependency.
+      #   --unset-all extraheader
+      #                  — actions/checkout@v4 leaves its own ephemeral,
+      #                    THIS-repo-scoped GITHUB_TOKEN in local git config,
+      #                    matched by URL PREFIX against ANY github.com fetch.
+      #                    Left in place it SHADOWS the token above and the
+      #                    clone fails with a credential that looks present.
+      #
+      # The empty-token guard is INSIDE the shell, not a step-level `if:` —
+      # the `secrets` context is not available in `if:`, and an unguarded
+      # rewrite with an empty token would emit
+      # `https://x-access-token:@github.com/` and break PUBLIC fetches for
+      # every existing caller. So a caller that passes no BOT_PAT is exactly
+      # unaffected.
+      - name: Configure git credentials for private git dependencies
+        shell: bash
+        env:
+          GIT_AUTH_TOKEN: ${{ secrets.BOT_PAT }}
+        run: |
+          if [ -n "${GIT_AUTH_TOKEN:-}" ]; then
+            git config --global url."https://x-access-token:${GIT_AUTH_TOKEN}@github.com/".insteadOf "https://github.com/"
+            git config --unset-all http.https://github.com/.extraheader || true
+          fi
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-compiler (linux aarch64 only)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Configure cross-linker
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+
+      # musl legs. A C toolchain is required rather than optional: crates with
+      # C or asm in them (ring, via rustls) compile a real object file for the
+      # target, so a rust-only musl target is not enough.
+      - name: Install musl toolchain (x86_64)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools musl-dev
+
+      - name: Install musl cross toolchain (aarch64)
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu musl-tools musl-dev
+          {
+            echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc"
+            echo "CC_aarch64_unknown_linux_musl=aarch64-linux-gnu-gcc"
+          } >> "$GITHUB_ENV"
+
+      # GPU / windowing system libs (winit/wgpu). Only on the ubuntu
+      # legs and only when system-deps is non-empty. macOS uses the
+      # Metal SDK and needs nothing here.
+      - name: Install system deps (ubuntu only)
+        if: runner.os == 'Linux' && inputs.system-deps != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ inputs.system-deps }}
+
+      - name: Build + stage
+        uses: pleme-io/actions/rust-cross-build@main
+        env:
+          # ★ THE THIRD HALF, and it is not optional when private git deps are
+          # in play. image-push.yml:555-560 records the incident verbatim: the
+          # `url.insteadOf` step above "ran clean, yet `cargo metadata` still
+          # failed to authenticate cloning a private git dependency,
+          # identically to before that step existed." This env var is Cargo's
+          # own documented remedy, named in the original error's hint text
+          # ("if the git CLI succeeds then net.git-fetch-with-cli may help").
+          #
+          # Unconditional: it only changes WHICH git implementation cargo
+          # fetches with (the system CLI instead of libgit2), never whether a
+          # credential is used, so a public-only caller is unaffected.
+          CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+        with:
+          binary-name:         ${{ inputs.binary-name }}
+          target:              ${{ matrix.target }}
+          suffix:              ${{ matrix.suffix }}
+          # ── PER-LEG override, falling back to the workflow-level input ──
+          # `matrix.features` is only set when a caller supplies its own
+          # `matrix-include`; the hardcoded default matrix has no such key, so
+          # `matrix.features` is null there and `||` yields `inputs.features`
+          # unchanged. That is what keeps every existing caller byte-identical.
+          #
+          # Why this exists: a cross-build matrix routinely needs DIFFERENT
+          # features per target — pangea-operator forked this whole workflow
+          # (97 lines, release.yml:403-499) for exactly one reason, stated in
+          # its own header: "the shared reusable's features/no-default-features
+          # inputs apply ONE pair to its WHOLE matrix". A fork is an expensive
+          # way to express a per-row value.
+          #
+          # NOTE the empty-string guard: `matrix.features || inputs.features`
+          # would also fall through when a leg DELIBERATELY sets `features: ""`
+          # to mean "no features here". Comparing against null instead makes
+          # "explicitly empty" expressible and distinct from "unset".
+          features: ${{ matrix.features == null && inputs.features || matrix.features }}
+          no-default-features: ${{ matrix.no-default-features == null && inputs.no-default-features || matrix.no-default-features }}
+
+      # ── Derive the release version from the tag (vX.Y.Z → X.Y.Z) ─────
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          ref="${GITHUB_REF#refs/tags/}"
+          echo "version=${ref#v}" >> "$GITHUB_OUTPUT"
+
+      # ── macOS app bundle → DMG (drag-to-Applications) + .app .zip ────
+      # The runner has rsvg-convert / sips / iconutil; iconutil IS
+      # available on GHA macOS runners (unlike the Nix sandbox), so we
+      # use the canonical `iconutil -c icns` path here. Same Info.plist
+      # keys as substrate's mkDarwinAppBundle.
+      - name: Assemble macOS .app
+        id: macapp
+        if: inputs.app-bundle && runner.os == 'macOS'
+        shell: bash
+        env:
+          APP_NAME:   ${{ inputs.app-name }}
+          BUNDLE_ID:  ${{ inputs.bundle-id }}
+          ICON_SVG:   ${{ inputs.icon-svg }}
+          EXE:        ${{ inputs.binary-name }}
+          VERSION:    ${{ steps.ver.outputs.version }}
+          MIN_SYS:    ${{ inputs.min-system-version }}
+        run: |
+          set -euo pipefail
+          brew list librsvg >/dev/null 2>&1 || brew install librsvg
+          app="${APP_NAME}.app"
+          contents="$app/Contents"
+          mkdir -p "$contents/MacOS" "$contents/Resources"
+
+          # binary
+          cp "dist/${EXE}-${{ matrix.suffix }}" "$contents/MacOS/${EXE}"
+          chmod +x "$contents/MacOS/${EXE}"
+
+          # icon: SVG → iconset PNGs → .icns (the 10 canonical slots)
+          iconset="${APP_NAME}.iconset"
+          mkdir -p "$iconset"
+          for spec in "16:16x16" "32:16x16@2x" "32:32x32" "64:32x32@2x" \
+                      "128:128x128" "256:128x128@2x" "256:256x256" \
+                      "512:256x256@2x" "512:512x512" "1024:512x512@2x"; do
+            px="${spec%%:*}"; slot="${spec##*:}"
+            rsvg-convert -w "$px" -h "$px" "$ICON_SVG" -o "$iconset/icon_${slot}.png"
+          done
+          iconutil -c icns "$iconset" -o "$contents/Resources/${APP_NAME}.icns"
+
+          # Info.plist — same keys as mkDarwinAppBundle
+          cat > "$contents/Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key><string>${APP_NAME}</string>
+            <key>CFBundleDisplayName</key><string>${APP_NAME}</string>
+            <key>CFBundleIdentifier</key><string>${BUNDLE_ID}</string>
+            <key>CFBundleExecutable</key><string>${EXE}</string>
+            <key>CFBundleIconFile</key><string>${APP_NAME}.icns</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>${VERSION}</string>
+            <key>CFBundleVersion</key><string>${VERSION}</string>
+            <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+            <key>NSHighResolutionCapable</key><true/>
+            <key>LSMinimumSystemVersion</key><string>${MIN_SYS}</string>
+          </dict>
+          </plist>
+          PLIST
+
+          # PkgInfo
+          printf 'APPL????' > "$contents/PkgInfo"
+
+          # Ad-hoc codesign so the .app isn't reported "damaged".
+          # NOT notarized — first-launch still needs right-click→Open or
+          # `xattr -dr com.apple.quarantine` (documented in INSTALL).
+          codesign -s - --force --deep "$app"
+
+          # .zip of the .app (some users prefer the bare bundle)
+          zipname="${APP_NAME}-${VERSION}-${{ matrix.suffix }}.zip"
+          ditto -c -k --keepParent "$app" "$zipname"
+          echo "zip=$zipname" >> "$GITHUB_OUTPUT"
+
+          # DMG with an /Applications symlink for drag-install
+          stage="dmg-stage"
+          mkdir -p "$stage"
+          cp -R "$app" "$stage/"
+          ln -s /Applications "$stage/Applications"
+          dmgname="${APP_NAME}-${VERSION}-${{ matrix.suffix }}.dmg"
+          hdiutil create -volname "${APP_NAME}" -srcfolder "$stage" \
+            -ov -format UDZO "$dmgname"
+          echo "dmg=$dmgname" >> "$GITHUB_OUTPUT"
+
+      # ── linux .tar.gz: binary + .desktop + icon + install.sh ────────
+      - name: Assemble linux app package
+        id: linapp
+        if: inputs.app-bundle && runner.os == 'Linux'
+        shell: bash
+        env:
+          APP_NAME:   ${{ inputs.app-name }}
+          ICON_SVG:   ${{ inputs.icon-svg }}
+          EXE:        ${{ inputs.binary-name }}
+          VERSION:    ${{ steps.ver.outputs.version }}
+          CATEGORIES: ${{ inputs.desktop-categories }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update && sudo apt-get install -y librsvg2-bin
+
+          pkg="${EXE}-pkg"
+          mkdir -p "$pkg"
+          cp "dist/${EXE}-${{ matrix.suffix }}" "$pkg/${EXE}"
+          chmod +x "$pkg/${EXE}"
+
+          # icon: SVG → 256px PNG
+          rsvg-convert -w 256 -h 256 "$ICON_SVG" -o "$pkg/${EXE}.png"
+
+          # .desktop entry (Exec points at the installed ~/.local/bin path)
+          cat > "$pkg/${EXE}.desktop" <<DESKTOP
+          [Desktop Entry]
+          Type=Application
+          Name=${APP_NAME}
+          Comment=${APP_NAME}
+          Exec=${EXE}
+          Icon=${EXE}
+          Terminal=false
+          Categories=${CATEGORIES}
+          DESKTOP
+
+          # tiny end-user installer (distributed artifact — allowed).
+          # The exe name is baked in at generation time (the workflow
+          # knows it), so the installer is pure copy-into-place glue.
+          cat > "$pkg/install.sh" <<INSTALL
+          #!/usr/bin/env sh
+          set -e
+          exe="${EXE}"
+          here="\$(cd "\$(dirname "\$0")" && pwd)"
+          mkdir -p "\$HOME/.local/bin" "\$HOME/.local/share/applications" \\
+                   "\$HOME/.local/share/icons/hicolor/256x256/apps"
+          install -m755 "\$here/\$exe" "\$HOME/.local/bin/\$exe"
+          install -m644 "\$here/\$exe.desktop" "\$HOME/.local/share/applications/\$exe.desktop"
+          install -m644 "\$here/\$exe.png" "\$HOME/.local/share/icons/hicolor/256x256/apps/\$exe.png"
+          command -v update-desktop-database >/dev/null 2>&1 && \\
+            update-desktop-database "\$HOME/.local/share/applications" || true
+          echo "Installed \$exe to ~/.local/bin (ensure it is on PATH)."
+          INSTALL
+          chmod +x "$pkg/install.sh"
+
+          tarname="${APP_NAME}-${VERSION}-${{ matrix.suffix }}.tar.gz"
+          tar -czf "$tarname" -C "$pkg" .
+          echo "tar=$tarname" >> "$GITHUB_OUTPUT"
+
+      # Handed to the linux-baseline job below, which re-checks the artifact on
+      # a pinned old runner. Uploading is what makes that check independent of
+      # wherever this leg happened to build.
+      - name: Upload linux x86_64 artifact for the baseline check
+        if: matrix.suffix == 'linux-x86_64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86_64-binary
+          path: dist/${{ inputs.binary-name }}-linux-x86_64
+          retention-days: 1
+
+      - name: Attach binaries to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/${{ inputs.binary-name }}-${{ matrix.suffix }}
+            dist/${{ inputs.binary-name }}-${{ matrix.suffix }}.sha256
+
+      - name: Attach macOS app packages to GitHub Release
+        if: inputs.app-bundle && runner.os == 'macOS' && startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ steps.macapp.outputs.dmg }}
+            ${{ steps.macapp.outputs.zip }}
+
+      - name: Attach linux app package to GitHub Release
+        if: inputs.app-bundle && runner.os == 'Linux' && startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ steps.linapp.outputs.tar }}
+
+  # ── Regression gate ──────────────────────────────────────────────────────
+  # The released linux binary must RUN on the oldest runner we support. This
+  # job is pinned to ubuntu-22.04 on purpose and downloads the artifact rather
+  # than testing it in place: an in-place check would silently start passing
+  # again the moment someone moved the build leg back to ubuntu-latest, which
+  # is exactly the regression it exists to catch.
+  #
+  # It has teeth. tatara-script v0.3.34 shipped linked against glibc 2.39 and
+  # every 22.04 consumer got
+  #   version `GLIBC_2.39' not found (required by tatara-script)
+  # at the moment of use, with nothing in the release pipeline having failed.
+  linux-baseline:
+    name: linux x86_64 runs on the oldest supported runner
+    needs: build
+    # A reusable workflow's `runs-on` executes in the CALLER's billing
+    # context, so a bare metered label here charges every PRIVATE consumer.
+    # That is what exhausted the org's Actions spending limit on 2026-08-08,
+    # after which every private repo's release path failed INSTANTLY with
+    # zero steps — which reads as "autobump/autorelease is broken" rather
+    # than "billing blocked". Public callers keep the exact label they had.
+    runs-on: ${{ github.event.repository.private && 'camelot-builder-pleme-eks' || 'ubuntu-22.04' }}
+    steps:
+      - name: Download the linux x86_64 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-x86_64-binary
+
+      - name: Report what the binary requires
+        run: |
+          chmod +x "${{ inputs.binary-name }}-linux-x86_64"
+          file "${{ inputs.binary-name }}-linux-x86_64"
+          echo "glibc versions required:"
+          objdump -T "${{ inputs.binary-name }}-linux-x86_64" 2>/dev/null \
+            | grep -oE 'GLIBC_[0-9.]+' | sort -Vu || echo "  none (static)"
+
+      # A musl artifact claims NO libc floor, so failing to run here is a broken
+      # promise and fails the release. A gnu artifact carries the build runner's
+      # glibc as a floor by construction; that is a known property, not a
+      # regression, so it is reported loudly and does not fail 9 consumers'
+      # pipelines. Move a consumer to linux-libc: musl to get the guarantee.
+      - name: Does it run on the oldest supported runner
+        id: baseline
+        continue-on-error: ${{ inputs.linux-libc != 'musl' }}
+        run: |
+          if ./${{ inputs.binary-name }}-linux-x86_64 --help >/dev/null 2>&1 \
+            || ./${{ inputs.binary-name }}-linux-x86_64 --version >/dev/null 2>&1 \
+            || ./${{ inputs.binary-name }}-linux-x86_64 >/dev/null 2>&1; then
+            echo "OK: runs on $(. /etc/os-release && echo "$PRETTY_NAME")"
+          else
+            echo "::warning::${{ inputs.binary-name }} does not run on ubuntu-22.04 (glibc $(ldd --version | head -1 | grep -oE '[0-9]+\.[0-9]+$')). Its floor is the build runner's glibc. Set linux-libc: musl for a floor-free artifact."
+            exit 1
+          fi
+
+      # The property a musl build promises is "no libc floor", and the ELF fact
+      # that CARRIES it is the absence of a PT_INTERP program header: with no
+      # dynamic loader named, nothing can demand a libc version at exec time.
+      # The second half is belt-and-braces — a versioned GLIBC_* import would be
+      # a floor even if some other loader were arranged.
+      #
+      # This used to grep file(1) for the literal string 'statically linked',
+      # which is a PROXY for that fact and the wrong one: rustc emits the
+      # *-unknown-linux-musl targets as static-PIE, and file(1) reports those as
+      # 'static-pie linked'. So the gate failed tatara-lisp v0.3.41 on an
+      # artifact that was static, imported zero GLIBC_* symbols, and had just
+      # been PROVEN to run on ubuntu-22.04 by the step directly above it. Assert
+      # the fact, never the phrasing of the tool that reports it.
+      - name: A musl build must carry no libc floor
+        if: inputs.linux-libc == 'musl'
+        run: |
+          bin="${{ inputs.binary-name }}-linux-x86_64"
+          if readelf -lW "$bin" | grep -qE '^[[:space:]]*INTERP[[:space:]]'; then
+            echo "::error::linux-libc is musl but $bin names a dynamic loader (PT_INTERP present)"
+            readelf -lW "$bin" | grep -A1 -E '^[[:space:]]*INTERP[[:space:]]'
+            exit 1
+          fi
+          floor="$(objdump -T "$bin" 2>/dev/null | grep -oE 'GLIBC_[0-9.]+' | sort -Vu)"
+          if [ -n "$floor" ]; then
+            echo "::error::linux-libc is musl but $bin imports versioned glibc symbols: $(echo "$floor" | tr '\n' ' ')"
+            exit 1
+          fi
+          echo "OK: no PT_INTERP, no versioned glibc symbols — no libc floor"
+          echo "     file(1) says: $(file -b "$bin")"

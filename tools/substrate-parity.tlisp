@@ -1,0 +1,106 @@
+;; substrate-parity — every flow in this repo is byte-identical to the copy
+;; the fleet still resolves.
+;;
+;; WHY THIS EXISTS, AND WHY IT IS TEMPORARY. This repo is the new home of the
+;; fleet's reusable workflow_call catalog, but the 1751 consumer references
+;; across ~759 repos still resolve `pleme-io/substrate/.github/workflows/...`.
+;; GitHub caps reusable workflows at 4 connected levels and two chains already
+;; sit at exactly 4 (shim -> pleme-stack -> auto-release -> action-release), so
+;; substrate CANNOT be left behind as a forwarding shim — that would add a level
+;; and break pleme-stack at runtime. The only migration shape available is a
+;; hard cutover of every reference at once.
+;;
+;; Until that cutover the two trees are duplicates, and duplication is a bug.
+;; This gate is what makes the interim honest: an edit landing in one tree and
+;; not the other fails here, instead of being discovered when a consumer runs
+;; the stale half.
+;;
+;; DELETE THIS FILE AT CUTOVER. It has no purpose once substrate no longer
+;; carries the flows, and a gate that outlives its reason becomes noise nobody
+;; reads.
+;;
+;; PRIMITIVE SPELLINGS ARE MEASURED, NOT GUESSED. `string-suffix?` and
+;; `file-exists?` do not exist in tatara-lisp v0.2.5 — the primitives list names
+;; them among the Scheme spellings deliberately absent. The real ones are
+;; `string-ends-with?` and `path-exists?`, and `path-basename` replaces a
+;; hand-rolled split. Probing a Scheme spelling, finding it missing, and
+;; concluding the capability is absent is the exact mistake that file was
+;; written to stop.
+;;
+;; Exit codes: 0 identical · 1 a flow differs, is missing, or is unexpectedly
+;; extra · 3 the scan found nothing to compare (the gate is broken, not the
+;; input).
+
+;; Where the calling workflow mounts the substrate checkout.
+(define SUBSTRATE-DIR "substrate/.github/workflows")
+(define LOCAL-DIR ".github/workflows")
+
+;; A floor, not a count assertion. 91 flows and 37 case tables moved on
+;; 2026-08-19; the floor sits well below that and far above zero because a
+;; COLLAPSED scan — a bad checkout, a wrong cwd, a glob that stopped matching —
+;; is as wrong as a mismatch, and only a floor above zero says so. A count
+;; assertion would instead fail every time a flow is legitimately added.
+(define MIN-FILES 40)
+
+;; Only files this repo is the home OF. substrate keeps its own CI — the
+;; selftests, its self-bump, its flakehub publish — and those are deliberately
+;; not mirrored, so comparing them would report a difference that is the
+;; correct state.
+(define (mirrored? n)
+  (or (string-ends-with? n ".yml")
+      (string-ends-with? n ".cases.tsv")))
+
+(define (compare-one n)
+  (let ((mine (string-append LOCAL-DIR "/" n))
+        (theirs (string-append SUBSTRATE-DIR "/" n)))
+    (cond
+      ((not (path-exists? theirs))
+        (print-line (string-append "EXTRA   " n " — present here, absent in substrate"))
+        1)
+      ((not (equal? (read-file mine) (read-file theirs)))
+        (print-line (string-append "DIFFERS " n))
+        1)
+      (else 0))))
+
+(define local-files
+  (filter (fn (p) (mirrored? (path-basename p)))
+          (glob (string-append LOCAL-DIR "/*"))))
+
+(print-line
+  (string-append "files compared: " (string-format "{}" (length local-files))))
+
+(when (< (length local-files) MIN-FILES)
+  (print-line
+    (string-append
+      "FATAL: found " (string-format "{}" (length local-files))
+      " files to compare, expected at least " (string-format "{}" MIN-FILES)
+      " — the scan compared nothing, which is not the same as finding no drift"))
+  (exit 3))
+
+(define drift
+  (reduce (fn (acc p) (+ acc (compare-one (path-basename p)))) 0 local-files))
+
+;; The other direction. Without this half the gate would pass a tree missing
+;; entire flows, because it only ever walks what is already local — a flow added
+;; to substrate and never mirrored here would be invisible.
+(define missing
+  (filter
+    (fn (p)
+      (and (string-contains? (read-file p) "workflow_call")
+           (not (path-exists? (string-append LOCAL-DIR "/" (path-basename p))))))
+    (glob (string-append SUBSTRATE-DIR "/*.yml"))))
+
+(reduce
+  (fn (acc p)
+    (print-line
+      (string-append "MISSING " (path-basename p) " — workflow_call flow not mirrored here"))
+    acc)
+  0 missing)
+
+(print-line
+  (string-append
+    "result: " (string-format "{}" (- (length local-files) drift))
+    "/" (string-format "{}" (length local-files)) " identical, "
+    (string-format "{}" (length missing)) " missing"))
+
+(exit (if (> (+ drift (length missing)) 0) 1 0))

@@ -1,0 +1,138 @@
+name: cd-stack
+
+# Turnkey CD pipeline. Composes:
+#   helm-deploy           → upgrade --install --wait
+#   flux-reconcile        → force-converge (optional)
+#   k8s-rollout-wait      → fine-grained gate
+#   slack-notify          → post deploy outcome (optional)
+#
+# Consumer:
+#   jobs:
+#     deploy:
+#       uses: pleme-io/substrate/.github/workflows/cd-stack.yml@main
+#       with:
+#         release: myapp
+#         chart: oci://ghcr.io/pleme-io/helm/myapp
+#         namespace: prod
+#       secrets: inherit
+
+on:
+  workflow_call:
+    inputs:
+      release:
+        type: string
+        required: true
+      chart:
+        type: string
+        required: true
+      namespace:
+        type: string
+        required: false
+        default: "default"
+      values-files:
+        type: string
+        required: false
+        default: ""
+      reconcile-after:
+        type: string
+        required: false
+        default: "false"
+      reconcile-kind:
+        type: string
+        required: false
+        default: "helmrelease"
+      notify-slack:
+        type: string
+        required: false
+        default: "false"
+    secrets:
+      KUBECONFIG_B64:
+        # required:false, deliberately — this is the same defect
+        # cargo-auto-release.yml already documents. GitHub validates the WHOLE
+        # reusable call graph at STARTUP, before any job `if:` is evaluated, so
+        # `required: true` fails the caller with zero jobs and no step output.
+        # On GitHub Free an ORG secret reaches PUBLIC repos only, so every
+        # PRIVATE caller's `secrets: inherit` passes nothing here and trips it
+        # — measured 2026-08-08 on pleme-io/caixa-url:
+        #   Error when evaluating 'secrets'. Secret KUBECONFIG_B64 is required,
+        #   but not provided while calling.
+        # A startup failure names no repo and runs no step, which reads as
+        # "autorelease is broken". Absence is caught at USE time instead, where
+        # the error can name the secret and the repo missing it.
+        required: false
+      SLACK_WEBHOOK_URL:
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    # A reusable workflow's `runs-on` executes in the CALLER's billing
+    # context, so a bare metered label here charges every PRIVATE consumer.
+    # That is what exhausted the org's Actions spending limit on 2026-08-08,
+    # after which every private repo's release path failed INSTANTLY with
+    # zero steps — which reads as "autobump/autorelease is broken" rather
+    # than "billing blocked". Public callers keep the exact label they had.
+    runs-on: ${{ github.event.repository.private && 'camelot-builder-pleme-eks' || 'ubuntu-latest' }}
+    outputs:
+      deployed: ${{ steps.h.outputs.deployed }}
+      revision: ${{ steps.h.outputs.revision }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Materialize kubeconfig
+        shell: bash
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBECONFIG_B64 }}" | base64 -d > ~/.kube/config
+          chmod 600 ~/.kube/config
+      - id: h
+        uses: pleme-io/actions/helm-deploy@main
+        with:
+          release: ${{ inputs.release }}
+          chart: ${{ inputs.chart }}
+          namespace: ${{ inputs.namespace }}
+          values-files: ${{ inputs.values-files }}
+
+  reconcile:
+    needs: deploy
+    if: inputs.reconcile-after == 'true'
+    # A reusable workflow's `runs-on` executes in the CALLER's billing
+    # context, so a bare metered label here charges every PRIVATE consumer.
+    # That is what exhausted the org's Actions spending limit on 2026-08-08,
+    # after which every private repo's release path failed INSTANTLY with
+    # zero steps — which reads as "autobump/autorelease is broken" rather
+    # than "billing blocked". Public callers keep the exact label they had.
+    runs-on: ${{ github.event.repository.private && 'camelot-builder-pleme-eks' || 'ubuntu-latest' }}
+    steps:
+      - name: Materialize kubeconfig
+        shell: bash
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBECONFIG_B64 }}" | base64 -d > ~/.kube/config
+          chmod 600 ~/.kube/config
+      - uses: pleme-io/actions/flux-reconcile@main
+        with:
+          kind: ${{ inputs.reconcile-kind }}
+          name: ${{ inputs.release }}
+          namespace: ${{ inputs.namespace }}
+
+  notify:
+    needs: [deploy, reconcile]
+    if: always() && inputs.notify-slack == 'true'
+    # A reusable workflow's `runs-on` executes in the CALLER's billing
+    # context, so a bare metered label here charges every PRIVATE consumer.
+    # That is what exhausted the org's Actions spending limit on 2026-08-08,
+    # after which every private repo's release path failed INSTANTLY with
+    # zero steps — which reads as "autobump/autorelease is broken" rather
+    # than "billing blocked". Public callers keep the exact label they had.
+    runs-on: ${{ github.event.repository.private && 'camelot-builder-pleme-eks' || 'ubuntu-latest' }}
+    steps:
+      - uses: pleme-io/actions/slack-notify@main
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          # Quoted: `: ` inside the format() literal breaks unquoted YAML
+          # scalars (0-job parse-failure class).
+          title: "${{ format('CD: {0} → {1}', inputs.release, needs.deploy.outputs.deployed == 'true' && 'deployed' || 'FAILED') }}"
+          body: ${{ format('chart={0} ns={1} revision={2}', inputs.chart, inputs.namespace, needs.deploy.outputs.revision) }}
+          color: ${{ needs.deploy.outputs.deployed == 'true' && 'good' || 'danger' }}

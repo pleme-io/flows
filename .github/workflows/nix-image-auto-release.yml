@@ -1,0 +1,760 @@
+# Reusable workflow: publish a Nix-built OCI image on push to main — the
+# AUTO-RELEASE shape for a repo whose artifact is a `dockerTools` image exposed
+# as a `nix run .#release` app (substrateLib.mkImageReleaseApp → forge
+# image-release). Pillar 8: the image is Nix-built, never a Dockerfile.
+#
+# Complements:
+#   - container-stack.yml      → Dockerfile (docker-build-and-push) images
+#   - crossplane-function-auto-release.yml → Function xpkg (embeds a Nix image)
+# This one is for the plain multi-arch Nix image case.
+#
+# Usage (consumer repo, the whole footprint):
+#   # .github/workflows/image-release.yml
+#   on: { push: { branches: [main] } }
+#   jobs:
+#     release:
+#       uses: pleme-io/substrate/.github/workflows/nix-image-auto-release.yml@main
+#       secrets: inherit
+
+name: nix-image-auto-release
+
+on:
+  workflow_call:
+    inputs:
+      release-app:
+        description: "Flake app that builds + pushes the image (substrateLib.mkImageReleaseApp)."
+        type: string
+        default: "release"
+      registry-host:
+        description: "OCI registry host to log into for the push."
+        type: string
+        default: "ghcr.io"
+      runner:
+        description: "Explicit runner label override; empty = route by caller repo visibility (private → camelot-builder-pleme-eks, public → ubuntu-24.04). Do NOT put an expression in this default — workflow_call input defaults are static; the fallback lives in the resolve job's `default:` input to pleme-io/actions/runner-resolve, evaluated in its own job because runs-on: cannot read a same-job step output."
+        type: string
+        default: ""
+      working-directory:
+        description: "Directory containing the flake.nix that exposes release-app (default: repo root). Set for a monorepo tool that isn't at the repo root, e.g. a nested tools/<name>/flake.nix."
+        type: string
+        default: "."
+      scan-before-push:
+        description: "Zero-tolerance CVE gate (theory/SECURITY-LAYER.md §8's 'build-time pre-publish CVE gate'): build image-attr locally, scan the LOCAL tarball with pleme-io/actions/image-scan (trivy --input, no registry round-trip -- the image has never been pushed anywhere at this point), and only run release-app (the push) if the scan is clean. False (default) preserves every existing caller's exact atomic build+push behavior unchanged -- opt in per consumer."
+        type: boolean
+        default: false
+      image-attr:
+        description: "Flake package attribute for the raw image derivation (e.g. 'rabbitmqImage'). Required when scan-before-push is true -- this is what gets built+scanned before release-app pushes it."
+        type: string
+        default: ""
+      scan-image-ref:
+        description: "Human-readable image ref (e.g. ghcr.io/pleme-io/rabbitmq:3.13.7-nix0) used ONLY as the scan's log/output label when scan-before-push is true -- nothing is pulled from it."
+        type: string
+        default: ""
+      scan-fail-on-severity:
+        description: "Lowest severity that fails the scan-before-push gate: UNKNOWN | LOW | MEDIUM | HIGH | CRITICAL | none. UNKNOWN = zero-tolerance (every severity gates)."
+        type: string
+        default: "UNKNOWN"
+      scan-ignore-unfixed:
+        description: "Skip vulns without an available fix in the scan-before-push gate. Never loosen this as a substitute for a named, tracked .trivyignore exception."
+        type: string
+        default: "false"
+      scan-ignore-file:
+        description: "Path (relative to the repo root) to a .trivyignore-format file of named, tracked exceptions for the scan-before-push gate -- each entry must carry its own justification, never a blanket severity loosening. Empty (default) = no exceptions."
+        type: string
+        default: ""
+      scan-vex-file:
+        description: >-
+          Path (relative to the repo root) to an OpenVEX document for the
+          scan-before-push gate. DISTINCT FROM scan-ignore-file ON PURPOSE: an
+          ignorefile says "stop telling me", a VEX statement is a published,
+          machine-readable claim WITH a justification that a downstream auditor
+          can read and dispute. Collapsing them would turn a compliance
+          mechanism into a suppression one. Use VEX for a finding that is REAL
+          in the SBOM and assessed not-affected in THIS artifact (no upstream
+          fix exists, or the vulnerable package is provably absent); use the
+          ignorefile only where no defensible claim can be made. Empty (default)
+          = no VEX, byte-identical trivy argv to before this input existed.
+          NOTE trivy matches a pre-publish (--input) statement by COMPONENT
+          purl, so such a document is image-independent BY SHAPE -- its scoping
+          comes from passing ONE document per image here, never from its
+          content. See hardened-images/vex/README-scoping.md.
+        type: string
+        default: ""
+      boot-check-cmd:
+        description: "Correctness gate, run AFTER the CVE scan and BEFORE the push (a CVE-clean image that crashes at boot is worse than useless -- theory/CAMELOT.md's own hardened-images incident, 2026-07-17: mysql+rabbitmq both passed 0-CVE scans and neither could boot). Health command exec'd inside the started container via pleme-io/actions/container-boot-check (e.g. 'mysqladmin ping --silent', 'rabbitmq-diagnostics -q ping'). Empty (default) = no boot-check -- every existing caller keeps its current behavior unchanged; opt in per consumer, same shape as scan-before-push."
+        type: string
+        default: ""
+      boot-check-image-ref:
+        description: "Local tag to docker-load the scanned tarball as before boot-testing it (e.g. 'rabbitmq:3.13.7-nix3'). Required when boot-check-cmd is set."
+        type: string
+        default: ""
+      boot-check-env:
+        description: "Newline-separated KEY=VALUE pairs passed to the boot-check container (e.g. MYSQL_ROOT_PASSWORD=... for a dev-only smoke boot)."
+        type: string
+        default: ""
+      boot-check-still-running:
+        description: "Boot-check a SHELL-LESS / distroless image. container-boot-check's normal mode does `docker exec <c> sh -c <boot-check-cmd>`, which needs a shell the image doesn't have -- so instead start the container and assert it is STILL RUNNING after the poll window (its `docker inspect .State.Running` fallback, triggered by an EMPTY health-cmd). The correct gate for a direct-exec binary with a self-booting config (e.g. vector on distroless-glibc: entrypoint runs the binary, a baked config keeps it alive, a boot crash exits the container -> caught). Requires boot-check-image-ref. When true it takes precedence over boot-check-cmd. False (default) preserves every existing caller unchanged."
+        type: boolean
+        default: false
+      boot-check-expect-log:
+        description: >-
+          Boot-check an image that CANNOT fully start in isolation -- a
+          Kubernetes controller with no cluster, or a one-shot CLI. Passes when
+          this exact string appears in `docker logs` (stdout+stderr), regardless
+          of exit code, proving the binary LOADED (shared libs resolved, no
+          glibc collision, no SIGSEGV before main) and reached its own startup
+          path. It does NOT prove the process serves traffic. Takes precedence
+          over boot-check-cmd. WHY THIS EXISTS: with boot-check-cmd empty AND
+          boot-check-still-running false, NEITHER boot-check step below runs --
+          the image ships with no load verification at all, silently, in a green
+          run. Measured 2026-08-01: 11 Go controller/operator images in
+          hardened-images are in exactly that state.
+        type: string
+        default: ""
+      vulnix-scan:
+        description: "Nix-closure CVE gate (vulnix, NVD-backed) -- complements scan-before-push's trivy gate, which structurally cannot see Nix-built images at all for whole classes of package: trivy's os-pkg scanner needs a dpkg/rpm/apk status DB (none exists in a Nix closure), and its language scanners only cover ecosystems with an embedded-buildinfo or lockfile scanner (Go, Rust) -- C/C++ and Erlang/OTP fall through both nets entirely. vulnix instead reads the package's own Nix derivation pname/version metadata against the NVD feed. Runs the consumer flake's own 'vulnix-scan:<name>' app (a nixpkgs-sourced vulnix, never an imperative install) against the package's runtime closure -- never the OCI image. False (default) preserves every existing caller unchanged; opt in per consumer, same shape as scan-before-push. A whitelist (vulnix's native TOML mechanism, the closure-scan sibling of a .trivyignore file) is a per-image Nix value in the consumer's own flake, not a workflow input here -- see pleme-io/hardened-images for the reference shape."
+        type: boolean
+        default: false
+      vulnix-scan-app:
+        description: "Flake app that runs the vulnix closure scan (e.g. 'vulnix-scan:mysql'). Required when vulnix-scan is true."
+        type: string
+        default: ""
+      vulnix-scan-advisory-only:
+        description: "Report vulnix findings without failing the job -- for a package whose closure has never been scanned before and has no committed whitelist baseline yet (a real, honest gap: an unscanned package's first run WILL surface findings nobody has triaged, and a hard gate on an untriaged baseline is indistinguishable from a broken pipeline). Flip to false (the default) once a real CI run's findings have seeded a committed vulnix whitelist for this package."
+        type: boolean
+        default: false
+      grype-scan:
+        description: "Second, independent CVE-database gate (Grype, Anchore) -- complements scan-before-push's trivy gate at the DATABASE layer, not the ecosystem layer: trivy and grype see the same OCI image but consult independent vuln feeds + matchers, so a finding either misses or mis-rates surfaces here even on an ecosystem trivy already covers (Go/Rust included -- unlike vulnix, grype is not restricted to trivy's structural blind spots). Runs the consumer flake's own 'grype-scan:<name>' app (a nixpkgs-sourced grype via substrate's mkCveGateApp, never an imperative install) against the SAME local docker-archive tarball scan-before-push already built -- no second build, no registry round-trip. False (default) preserves every existing caller unchanged; opt in per consumer, same shape as vulnix-scan. Requires scan-before-push (needs image-attr built first)."
+        type: boolean
+        default: false
+      grype-scan-app:
+        description: "Flake app that runs the grype image scan (e.g. 'grype-scan:mysql'). Required when grype-scan is true."
+        type: string
+        default: ""
+      grype-scan-advisory-only:
+        description: "Report grype findings without failing the job -- for an image whose grype baseline has never been triaged yet (same honest-gap rationale as vulnix-scan-advisory-only). Flip to false (the default) once a real CI run's findings have been triaged for this image."
+        type: boolean
+        default: false
+      extraSubstituters:
+        description: "Extra Nix binary-cache URL(s) to pull from (space-separated) -- e.g. the in-cluster sui super-cache daemon (http://sui.camelot-build.svc) so heavy builds SUBSTITUTE instead of compiling. Same input shape as image-push.yml's own extraSubstituters (mirrored here -- this reusable had never carried it, confirmed live: every hardened-images build paid full cold-compile cost despite running on the same cluster/VPC sui lives on). Empty (default) = no extra cache, zero blast radius for existing consumers."
+        type: string
+        default: ""
+      extraTrustedPublicKeys:
+        description: "Trusted public key(s) for extraSubstituters (space-separated, 'name:base64' form). Required when extraSubstituters is set and require-sigs isn't relaxed, else Nix refuses the unsigned/untrusted cache."
+        type: string
+        default: ""
+      requireSigs:
+        description: "Set 'false' to accept UNSIGNED NARs from extraSubstituters -- e.g. sui serves unsigned closures. Empty = nix default (signatures required; zero blast radius for existing consumers)."
+        type: string
+        default: ""
+      superCacheSaveEndpoint:
+        description: "sui super-cache endpoint to PUSH the just-built image-attr's store path to (e.g. http://sui.camelot-build.svc), via pleme-io/actions/super-cache-save. The write half of extraSubstituters above -- without this, every consumer that reads from sui never contributes back, so a from-source overlay (e.g. hardened-images' custom erlang_26 build) recompiles from scratch on every single run forever, even after a successful build. Runs after the local build (scan-before-push's `nix build`, or a fresh build if scan-before-push is false) and before the CVE gates, since the cache write is a pure content-addressed store-path push independent of what the scans later decide -- a rebuild from the same cached bytes always re-scans identically. Best-effort (never fails the job on a push error -- see super-cache-save's own README). Empty (default) = no push, zero blast radius for existing consumers."
+        type: string
+        default: ""
+      sbom-attest:
+        description: "Generate an SBOM (syft) from the just-built local tarball and cosign-attest it to the PUSHED image ref (substrate's mkSbomAttestApp) -- runs AFTER release-app, since attestation needs a real registry ref cosign/Rekor can record against. Requires cosign keyless signing (ambient GitHub Actions OIDC -- the caller must grant id-token: write, which this reusable's own top-level permissions block does). Runs the consumer flake's own 'sbom-attest:<name>' app. False (default) preserves every existing caller unchanged; opt in per consumer."
+        type: boolean
+        default: false
+      sbom-attest-app:
+        description: "Flake app that generates + attests the SBOM (e.g. 'sbom-attest:rabbitmq'). Required when sbom-attest is true."
+        type: string
+        default: ""
+      cosign-sign:
+        description: "Keyless-sign the PUSHED image ref (substrate's mkCosignSignApp, Sigstore Fulcio+Rekor -- no long-lived key to rotate). Runs the consumer flake's own 'cosign-sign:<name>' app, after release-app. False (default) preserves every existing caller unchanged; opt in per consumer."
+        type: boolean
+        default: false
+      cosign-sign-app:
+        description: "Flake app that runs the cosign sign (e.g. 'cosign-sign:rabbitmq'). Required when cosign-sign is true."
+        type: string
+        default: ""
+      cartorio-attest:
+        description: "FedRAMP three-pillar delivery receipt (pleme-io/actions/cartorio-attest): a BLAKE3 chain-linked receipt + a CycloneDX SBOM built FROM THE NIX CLOSURE + SLSA v1.0 provenance, for the pushed image ref. Runs AFTER release-app. Unlike sbom-attest (syft over the image filesystem) this SBOM is derived from the image's closureInfo (cartorio-closure-info-attr) -- the ROBUST source for a compressed dockerTools image whose own Nix-registered references are near-empty. Cheap by construction: the closure is ALREADY realized locally from scan-before-push's `nix build .#<image-attr>` moments earlier, so building the closure-info attr is a cache hit, never a recompile. The closure exists here where the bytes are genuinely built -- a pulled image downstream cannot re-derive it, so attestation MUST live here. False (default) preserves every existing caller unchanged; opt in per consumer. Needs scan-before-push (the local build that realizes the closure)."
+        type: boolean
+        default: false
+      cartorio-subject:
+        description: "cartorio-attest `subject` -- the attested artifact name (e.g. 'hardened-vector'). Required when cartorio-attest is true."
+        type: string
+        default: ""
+      cartorio-closure-info-attr:
+        description: "Flake package attr producing the image's `pkgs.closureInfo` output dir (a `store-paths` file), the cartorio SBOM source (e.g. 'vectorClosureInfo'). `nix build .#<attr>` here is a local cache hit off the just-built image closure. Required when cartorio-attest is true."
+        type: string
+        default: ""
+    secrets:
+      BOT_PAT:
+        description: "Org PAT with write:packages, preferred by registry-login for OCI push to the org-shared ghcr.io/pleme-io namespace (a repo-scoped GITHUB_TOKEN 403s cross-namespace). Reaches public repos only on the Free plan; private repos fall through to GITHUB_TOKEN."
+        required: false
+      GHCR_TOKEN:
+        description: "Optional dedicated registry token. registry-login prefers BOT_PAT, then this, then GITHUB_TOKEN."
+        required: false
+      ECR_TOKEN:
+        description: >-
+          Password for the SOURCE registry a vendor rewrap PULLS FROM, when
+          that registry is private (lib/build/oci/hardened-base.nix's
+          `srcCredsEnv` / `srcCredsUser`). Orthogonal to BOT_PAT/GHCR_TOKEN,
+          which authenticate the DESTINATION push -- a rewrap of a private
+          upstream needs both, at opposite ends of the same job. The variable
+          NAME is fixed at `ECR_TOKEN` because a `secrets:` key cannot be
+          computed from an input, and the consumer's own `srcCredsEnv` must
+          name the SAME string for the derivation's `impureEnvVars` entry to
+          match; a consumer that names anything else gets an unauthenticated
+          pull, not a mismatch error (pleme-io/hardened-images' three
+          classicHardenedClickhouse* entries already declare exactly
+          `srcCredsEnv = "ECR_TOKEN"`). Optional: absent, every existing
+          caller is byte-identical -- an image with no `srcCredsEnv` never
+          reads it, and the derivation's own `${ECR_TOKEN:?…}` guard refuses
+          an unauthenticated pull rather than silently attempting one.
+          NOTE this carries a STATIC secret. `aws ecr get-login-password`
+          mints a ~12h token, so an ECR consumer wants a value minted per run
+          (pleme-io/actions/aws-assume-role -> ECR_TOKEN) rather than a repo
+          secret that goes stale; this input is the transport, not the
+          lifetime policy.
+        required: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  # ★★ ZERO-SUPPRESSION ratchet (theory/NIX-HARDENING.md §VII.6) — a standalone,
+  # report-only lint scanning the CALLER repo's full suppression surface
+  # (.trivyignore / vulnix whitelists / grype-VEX ignores AND the workflow-YAML
+  # gate-weakeners: *-advisory-only:true, ignore-unfixed:true, scan-ignore-file).
+  # Standalone (no needs:, nothing needs it) + report-only (fail-on-violation:false)
+  # so it can NEVER fail a consumer's release — it just surfaces suppression on
+  # every image build, fleet-wide, zero per-repo footprint. A consumer graduates to
+  # hard-fail by shipping its own cve-suppression-gate.yml with fail-on-violation:
+  # true once its no-cve-suppression/baseline.txt is validated.
+  # ★ TRIAGE HAZARD, measured 2026-07-31: a `continue-on-error` job still reports
+  # `conclusion: failure` in the GitHub API. `gh run view --json jobs` cannot
+  # distinguish it from a job that genuinely blocked the release — I queried
+  # `[.jobs[]|select(.conclusion=="failure")]` on a real run, got these two, and
+  # only knew they were non-blocking by reading this file. Any automated triage
+  # (a dashboard, a bot, an agent) will miscount them, in BOTH directions: it
+  # reads a healthy run as broken, and — worse — a genuine blocker sitting in the
+  # same list gets dismissed along with the noise once people learn to ignore it.
+  # Read `.conclusion` of the RUN, or check this flag, before calling a run red.
+  cve-suppression-visibility:
+    name: CVE-suppression visibility (report-only)
+    # Visibility-routed, NOT a bare ubuntu-latest (corrected 2026-07-24): this
+    # job is `continue-on-error: true`, so a private consumer should never see
+    # it fail the release -- but continue-on-error only suppresses a job that
+    # actually STARTS and whose STEPS fail. On the Free org plan a private
+    # repo's GitHub-hosted job is rejected at DISPATCH by the billing/spending-
+    # limit gate ("recent account payments have failed"), before any step runs,
+    # so continue-on-error never applies and the whole run goes red on every
+    # private consumer (confirmed live -- pleme-io/hardened-images run
+    # 30062292762: every release-* invocation's copy of this job failed in ~3s
+    # at dispatch, turning the run red while the actual build+push jobs
+    # succeeded). Route by the caller's own repo visibility exactly like the
+    # `resolve` job below already does: private -> the self-hosted ARC pool
+    # (the job STARTS, so continue-on-error correctly absorbs any step
+    # failure), public -> ubuntu-latest (free hosted minutes, unchanged). Same
+    # idiom, same file, same rationale as `resolve`.
+    runs-on: ${{ github.event.repository.private && 'camelot-builder-pleme-eks' || 'ubuntu-latest' }}
+    # report-only advisory (fail-on-violation:false); the no-cve-suppression
+    # tatara-script has a not-yet-root-caused runtime error, so it must never
+    # false-red a consumer's release. Remove once the script bug is fixed.
+    # pending-no-cve-suppression: script-error
+    continue-on-error: true
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pleme-io/actions/no-cve-suppression@main
+        with:
+          fail-on-violation: "false"
+
+  # Runner routing lives in its own job: GitHub Actions' `runs-on:` can only
+  # reference github/needs/strategy/matrix/vars/inputs contexts — never a
+  # same-job step output — so the resolution has to happen in a job of its
+  # own and every consumer job depends on it via needs.resolve.outputs.runner.
+  # pleme-io/actions/runner-resolve applies typed precedence (override >
+  # repo-committed .github/runner.yml > this job's `default`). `default` here
+  # is the same private→camelot-builder-pleme-eks / public→ubuntu-24.04 split
+  # as before, keyed off github.event.repository.private (the caller's event
+  # payload) rather than an org-level Actions variable: pleme-io is on the
+  # GitHub Free org plan, which does not share org vars/secrets into private
+  # repos' workflow-evaluation context, so a vars.*-based fallback silently
+  # resolves empty there. Same idiom as helm-monorepo-auto-release.yml/
+  # rust-auto-release.yml/python-auto-release.yml.
+  resolve:
+    name: Resolve runner
+    # The resolve job itself needs somewhere to run before it can tell
+    # `publish` where to run -- github.event.repository.private is directly
+    # readable in runs-on: (no step-output dependency, unlike inputs.runner's
+    # own default further down), so route THIS job the same private/public
+    # way instead of hardcoding ubuntu-latest. Found live 2026-07-17: with
+    # pleme-io's GitHub org billing/spending-limit blocked, every private
+    # repo's resolve job (and therefore every downstream release-* job) was
+    # failing before it ever reached the self-hosted pool this whole routing
+    # exists to reach -- the routing job was itself the one still paying for
+    # GitHub-hosted minutes.
+    runs-on: ${{ github.event.repository.private && 'camelot-builder-pleme-eks' || 'ubuntu-latest' }}
+    outputs:
+      runner: ${{ steps.resolve.outputs.runner }}
+    steps:
+      - name: Resolve runner
+        id: resolve
+        uses: pleme-io/actions/runner-resolve@main
+        with:
+          default: ${{ github.event.repository.private && 'camelot-builder-pleme-eks' || 'ubuntu-24.04' }}
+          override: ${{ inputs.runner }}
+
+  publish:
+    name: Build + push Nix image
+    needs: resolve
+    runs-on: ${{ needs.resolve.outputs.runner }}
+    if: github.actor != 'github-actions[bot]'
+    permissions:
+      contents: read
+      packages: write
+      # Needed only when cosign-sign/sbom-attest is true -- keyless cosign
+      # signing exchanges this job's own short-lived OIDC token for a
+      # Fulcio cert (no long-lived signing key to rotate). Granting it
+      # unconditionally at the job level (GitHub Actions permissions can't
+      # be conditioned on an input) is the standard, narrow shape: it lets
+      # THIS job request an OIDC token scoped to itself, nothing more --
+      # zero blast radius for callers that never set cosign-sign/sbom-attest.
+      id-token: write
+    env:
+      # Source-registry password for a private upstream pull, under the exact
+      # name hardened-base.nix's `srcCredsEnv` declares. JOB-level, not on one
+      # step: ANY nix invocation in this job can be the one that realizes the
+      # pull FOD -- the scan-before-push `nix build`, the grype and vulnix gate
+      # apps, `nix run .#<release-app>` (the ONLY build at all in the default
+      # scan-before-push:false mode), and the cartorio closure-info build.
+      # Enumerating them is how a step added later silently loses the
+      # credential and regresses to an anonymous pull. Renders empty for every
+      # caller that passes no secret, which the derivation's own
+      # `${ECR_TOKEN:?…}` guard treats identically to unset.
+      #
+      # This is HALF the delivery -- see the Install Nix step's `impure-env`
+      # lines for the other half and for why one env export is not enough.
+      ECR_TOKEN: ${{ secrets.ECR_TOKEN }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # GitHub-hosted runners ship ~14GB usable disk; a large from-source Nix
+      # image closure (vector's Rust compile, the erlang_26 overlay) needs more.
+      # Reclaim ~25GB by removing preinstalled toolchains this build never uses.
+      # Gated to hosted runners (contains 'ubuntu') -- ARC/self-hosted nodes have
+      # ample disk and none of these paths. This is what lets a public repo's big
+      # compiles COMPLETE on the stable free hosted runners instead of the
+      # spot-flaky ARC pool (which reclaims runners mid-build).
+      - name: Free disk space (hosted runners only)
+        if: contains(needs.resolve.outputs.runner, 'ubuntu')
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
+            /usr/local/share/boost /usr/local/lib/android "${AGENT_TOOLSDIRECTORY:-/opt/hostedtoolcache}" 2>/dev/null || true
+          sudo docker image prune -af 2>/dev/null || true
+          df -h /
+
+      # ── A CACHE MUST DEGRADE, NOT DECIDE. ──────────────────────────────────
+      # `fallback` and `connect-timeout` are set ONLY when extraSubstituters is,
+      # so a caller without an extra cache is byte-identical to before.
+      #
+      # WHY, measured: hardened-images run 30665557380 (release-clickhouse-keeper)
+      # died with
+      #   error: unable to download 'http://sui.camelot-build.svc/....narinfo':
+      #          Timeout was reached (28) Connection timed out after 15001 ms
+      # after ~20 retries across four store paths. The build never reached its
+      # compile step, let alone its CVE gate or boot-check.
+      #
+      # nix's `fallback` DEFAULTS TO FALSE, so a substituter that cannot be
+      # reached is not skipped -- it fails the build. That inverts what a binary
+      # cache is for: sui exists to make heavy builds cheap, and instead its
+      # absence made them impossible. An optimization whose outage is fatal is
+      # not an optimization, it is an undeclared hard dependency on a
+      # cluster-internal service.
+      #
+      # `fallback = true` restores the intended semantics (substitute if you can,
+      # otherwise build it), and `connect-timeout = 5` stops each unreachable
+      # path burning 15s before nix concludes the obvious. Neither weakens
+      # anything: signature policy is untouched, and a REACHABLE sui is used
+      # exactly as before.
+      #
+      # ── AN IMPURE ENV VAR REACHES THE BUILDER FROM THE DAEMON, NOT FROM US ─
+      # hardened-base.nix pulls a private upstream inside a fixed-output
+      # derivation carrying `impureEnvVars = [ <srcCredsEnv> ]` -- legal
+      # because `upstreamSha256` pins the output. That attribute does NOT read
+      # the environment of the `nix build` that requested the build. Nix's own
+      # manual, verbatim: "impureEnvVars implementation takes environment
+      # variables from the current builder process. When a daemon is building
+      # its environmental variables are used. Without the daemon, the
+      # environmental variables come from the environment of the nix-build."
+      # A GitHub-hosted runner is squarely the daemon case (`runner` cannot
+      # write /nix/var/nix, so `store = auto` resolves to the daemon socket),
+      # and that daemon was started at install time with no ECR_TOKEN in
+      # sight. MEASURED, not inferred: a FOD declaring `impureEnvVars =
+      # [ "PROBE_VAR" ]`, built through a daemon store with PROBE_VAR exported
+      # in the client's environment, saw it UNSET. So the job-level env export
+      # above covers ONLY the other store mode -- a runner whose job is root,
+      # where `auto` resolves to LocalStore and the client IS the builder.
+      #
+      # `impure-env` is the one supported client-supplied route, and it is
+      # gated behind the `configurable-impure-env` experimental feature. BOTH
+      # lines have to land in the DAEMON's nix.conf, which is what `extra-conf`
+      # writes: Nix's `RemoteStore::setOptions` explicitly erases
+      # `experimental-features` from the setting overrides a client forwards
+      # over the daemon socket, so enabling the feature via NIX_CONFIG or a CLI
+      # flag reaches the client and never the builder (`impure-env` itself is
+      # NOT erased, but is ignored without the feature). Same placement, same
+      # reason, as image-push.yml's `access-tokens` line: the daemon nix.conf is
+      # trusted at install time, so it is honored regardless of trusted-user
+      # status.
+      #
+      # ── GH_TOKEN ADDED 2026-08-18: private Go modules in a vendor FOD ──────
+      #
+      # A buildGoModule vendor derivation for a repo that imports a PRIVATE
+      # pleme-io module cannot fetch it: proxy.golang.org 404s a private module,
+      # so `go mod download` falls through to `direct` and needs a git
+      # credential INSIDE THE BUILDER. `pleme-io/actions/git-credentials`
+      # configures git on the RUNNER, which a Nix builder does not inherit, and
+      # the nix-installer's own `github-token` only reaches NIX's fetchers
+      # (flake inputs), never a `go mod download` running inside a derivation.
+      #
+      # substrate already ships the consumer half -- lib/build/go/private-module.nix,
+      # and pitr-reclaimer's flake declares
+      # `impureEnvVars = [ "GITHUB_TOKEN" "GH_TOKEN" ]` on its goModules FOD with
+      # a GOPRIVATE + per-host `insteadOf` preBuild. Both halves were correct and
+      # never met: the ONLY impure-env channel here was named ECR_TOKEN (a
+      # SOURCE-REGISTRY concern for vendor rewraps), so the token never arrived
+      # under a name the flake looks for. Measured 2026-08-18: pitr-reclaimer's
+      # image has never been published, and a fresh dispatch failed in
+      # `pitr-reclaimer-0.1.0-go-modules.drv` for exactly this.
+      #
+      # ★ ONE `impure-env` LINE, NOT TWO. It is a single nix.conf setting whose
+      # value is a whitespace-separated list of `name=value` items -- a second
+      # line does not merge, it OVERRIDES. So both channels are composed into one
+      # line, and the feature gate now fires when EITHER secret is present.
+      #
+      # INERT FOR EXISTING CALLERS. impure-env only reaches a derivation that
+      # DECLARES the name in its own `impureEnvVars`; a build that declares
+      # neither never sees either value. And the derivations that do are
+      # FIXED-OUTPUT, so their bytes stay pinned by vendorHash -- a token
+      # influences HOW bytes are fetched, never WHICH land. Same
+      # byte-identical-for-non-adopters property the ECR_TOKEN input already has.
+      #
+      # BOT_PAT rather than GITHUB_TOKEN: GITHUB_TOKEN is scoped to the CALLING
+      # repo and structurally cannot read a sibling private repo, which is the
+      # whole failure being fixed. The name GH_TOKEN is used because the
+      # consumer's `${GITHUB_TOKEN:-${GH_TOKEN:-}}` accepts either and GH_TOKEN
+      # does not collide with the runner's own GITHUB_TOKEN semantics.
+      #
+      # Both lines are gated on the secret, so a caller that passes none
+      # renders two blank lines and an unchanged nix.conf -- the same shape the
+      # extraSubstituters lines below already use.
+      #
+      # ONE SHARP EDGE: `impure-env` is a whitespace-separated list of
+      # `name=value` items, so a token CONTAINING a space is silently truncated
+      # at the space rather than rejected, and the pull then fails as a plain
+      # auth error. Every registry token this is for (ECR, GHCR, a Harbor robot)
+      # is base64/JWT-shaped and whitespace-free by construction, so this is a
+      # constraint to know rather than one to guard.
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+        with:
+          github-token: ${{ secrets.BOT_PAT }}
+          determinate: false
+          extra-conf: |
+            sandbox = relaxed
+            ${{ (secrets.ECR_TOKEN || secrets.BOT_PAT) && 'extra-experimental-features = configurable-impure-env' || '' }}
+            ${{ (secrets.ECR_TOKEN || secrets.BOT_PAT) && format('impure-env = {0}{1}', secrets.ECR_TOKEN && format('ECR_TOKEN={0} ', secrets.ECR_TOKEN) || '', secrets.BOT_PAT && format('GH_TOKEN={0}', secrets.BOT_PAT) || '') || '' }}
+            ${{ inputs.extraSubstituters && format('extra-substituters = {0}', inputs.extraSubstituters) || '' }}
+            ${{ inputs.extraTrustedPublicKeys && format('extra-trusted-public-keys = {0}', inputs.extraTrustedPublicKeys) || '' }}
+            ${{ inputs.requireSigs && format('require-sigs = {0}', inputs.requireSigs) || '' }}
+            ${{ inputs.extraSubstituters && 'fallback = true' || '' }}
+            ${{ inputs.extraSubstituters && 'connect-timeout = 5' || '' }}
+
+      # scan-before-push mode: build the raw image derivation LOCALLY first
+      # (no push) so the CVE gate below scans it before it has ever touched
+      # a registry. Skipped entirely in the default (false) mode, which
+      # preserves every existing caller's exact atomic build+push step.
+      - name: Build image locally (scan-before-push gate)
+        if: inputs.scan-before-push
+        env:
+          IMAGE_ATTR: ${{ inputs.image-attr }}
+        run: nix build ".#${IMAGE_ATTR}" --print-build-logs
+
+      # Push half of extraSubstituters above -- the built store path becomes
+      # a durable, content-addressed cache entry so a from-source overlay
+      # (e.g. a custom erlang_26 build) is only ever compiled once fleet-wide,
+      # not once per CI run. `result` is the standard `nix build` output
+      # symlink the step above just created; resolved to its real store path
+      # since super-cache-save's `outputs` wants store paths, not symlinks.
+      # THE RESOLUTION THE COMMENT ABOVE CLAIMED, NOW ACTUALLY PERFORMED.
+      # Measured 2026-08-02 on hardened-images run 30708771205: the push step
+      # reported SUCCESS in 30 of 33 build jobs while logging
+      #   "super-cache-save: 0 store paths pushed"
+      # in 6 of 6 sampled jobs. Cause: `outputs` was passed
+      # `${{ github.workspace }}/result` -- the workspace SYMLINK. super-cache-
+      # save extracts a store path by splitting the token on the literal
+      # "/nix/store/"; a workspace path contains no such substring, so
+      # token->store-path returns "" (its documented behaviour, correct), the
+      # push list is empty, and the step exits 0 having done nothing.
+      #
+      # The requirement was never unknown -- the comment above states it exactly
+      # ("wants store paths, not symlinks") and describes the resolution in the
+      # PAST TENSE, above the line that omitted it. A `with:` expression cannot
+      # call readlink, so the resolution needs its own step; that step was never
+      # written.
+      - name: Resolve the built store path (super-cache-save wants a store path)
+        id: built-store-path
+        if: inputs.scan-before-push && inputs.superCacheSaveEndpoint != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          p="$(readlink -f result)"
+          case "$p" in
+            /nix/store/*) ;;
+            *) echo "::error::resolved path is not a store path: $p"; exit 1;;
+          esac
+          echo "path=$p" >> "$GITHUB_OUTPUT"
+          echo "resolved result -> $p"
+
+      - name: Push built image to super-cache (sui)
+        if: inputs.scan-before-push && inputs.superCacheSaveEndpoint != ''
+        uses: pleme-io/actions/super-cache-save@main
+        with:
+          endpoint: ${{ inputs.superCacheSaveEndpoint }}
+          outputs: ${{ steps.built-store-path.outputs.path }}
+          # super-cache-save's first guard clause is `key == "" -> no-op`,
+          # unconditionally, even on the sui-endpoint-push branch where key
+          # is otherwise only used as an output label (the actual push is
+          # gated on endpoint+outputs, not key -- Nix's own content-
+          # addressing is what makes a re-push of identical bytes a cheap
+          # no-op server-side). image-attr is a stable, always-non-empty
+          # per-image identifier -- sufficient to clear the guard.
+          key: ${{ inputs.image-attr }}
+
+      # A failing scan stops the job HERE (GitHub Actions' default: a job
+      # stops at its first failing step) -- the push step below is
+      # structurally unreachable on red, never merely advisory.
+      - name: Zero-tolerance CVE gate (pre-publish — scans the LOCAL tarball, never a pushed image)
+        if: inputs.scan-before-push
+        uses: pleme-io/actions/image-scan@main
+        with:
+          image-ref: ${{ inputs.scan-image-ref }}
+          local-archive: result
+          fail-on-severity: ${{ inputs.scan-fail-on-severity }}
+          ignore-unfixed: ${{ inputs.scan-ignore-unfixed }}
+          ignore-file: ${{ inputs.scan-ignore-file }}
+          vex: ${{ inputs.scan-vex-file }}
+
+      # Second-opinion CVE-database gate (grype) -- sibling to the trivy gate
+      # above, same artifact (the app builds `images_.<name>` as an ordinary
+      # Nix build input, which is the same store path scan-before-push
+      # already realized via `nix build ".#${image-attr}"` moments ago, so
+      # this is a cache hit, not a second build). A failing scan (any
+      # finding at/above the app's configured failOn threshold) stops the
+      # job here, same as the trivy gate.
+      - name: Zero-tolerance CVE gate #2 (grype -- independent CVE database + matcher from trivy)
+        if: inputs.grype-scan
+        continue-on-error: ${{ inputs.grype-scan-advisory-only }}
+        env:
+          GRYPE_SCAN_APP: ${{ inputs.grype-scan-app }}
+        run: nix run ".#${GRYPE_SCAN_APP}"
+
+      # vulnix's own NVD feed corpus is ~300MB and vulnix itself only
+      # re-fetches a year's archive when NVD reports it changed (confirmed
+      # live: a warm-cache re-scan against an unchanged corpus dropped from
+      # ~60s to ~2.5s) -- restoring the most recent prior cache via
+      # restore-keys (the key itself never matches exactly, so a fresh
+      # cache is always saved after this job) makes every run after the
+      # first a small incremental fetch instead of the full corpus, under
+      # vulnix's own default cache dir so the generated vulnix-scan:<name>
+      # app needs no CI-specific path override.
+      - name: Restore vulnix NVD feed cache
+        if: inputs.vulnix-scan
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/vulnix
+          key: vulnix-nvd-${{ github.run_id }}
+          restore-keys: |
+            vulnix-nvd-
+
+      # Nix-closure CVE gate (vulnix) -- sibling to the trivy gate above,
+      # covering the ecosystems it structurally cannot (see the vulnix-scan
+      # input's own description). Scans the PACKAGE's closure, not the OCI
+      # image -- no image build or docker-archive dependency, can run
+      # independently of scan-before-push/boot-check. A failing scan (any
+      # non-whitelisted finding) stops the job here, same as the trivy gate.
+      - name: Nix-closure CVE gate (vulnix -- covers what the trivy gate above structurally cannot)
+        if: inputs.vulnix-scan
+        continue-on-error: ${{ inputs.vulnix-scan-advisory-only }}
+        env:
+          VULNIX_SCAN_APP: ${{ inputs.vulnix-scan-app }}
+        run: nix run ".#${VULNIX_SCAN_APP}"
+
+      # Correctness gate, after the CVE scan and before anything ships --
+      # matching the customer-facing hardened-images pipeline's own pattern
+      # exactly (that pipeline already learned this lesson: a
+      # CVE-clean image that crashes at boot is worse than useless). docker
+      # load, not a registry pull -- the same local tarball the scan step
+      # above just cleared, never touched a registry yet.
+      - name: Load image into Docker for boot-check
+        # boot-check-expect-log MUST be in this predicate. It was not when the
+        # third mode landed (2026-08-01), and the consequence was measured on
+        # hardened-images run 30708771205: FIVE jobs red with
+        #   docker run failed: Unable to find image '...' locally
+        # The new check step fired correctly; the image it needed was never
+        # loaded, because this LOAD step's condition still listed only the two
+        # original modes.
+        #
+        # I made the two CHECK steps mutually exclusive with the new one and
+        # never looked at the step that FEEDS them -- the exact "every control I
+        # add is also a refactor" failure I had written down one tick earlier.
+        # A three-way predicate here and a two-way predicate there is invisible
+        # to actionlint, to yq, and to any local render test; only a real run
+        # shows it.
+        if: inputs.boot-check-cmd != '' || inputs.boot-check-still-running || inputs.boot-check-expect-log != ''
+        run: docker load -i result
+
+      # Two mutually-exclusive boot-check steps rather than one with a
+      # `still-running && '' || cmd` health-cmd ternary -- that trick is UNSAFE
+      # in GitHub expressions because '' is falsy, so `true && '' || cmd`
+      # evaluates to `cmd`, not ''. Explicit gates keep the still-running
+      # (empty health-cmd) and exec-poll (non-empty) paths unambiguous.
+      # Third mode, and it takes PRECEDENCE over the two below: an image that
+      # cannot fully start in isolation can satisfy neither of them. Without
+      # this, such an image had no third option -- it fell through both `if`s
+      # and shipped with NO boot verification, green.
+      - name: Correctness gate (boot-check — expected startup marker, non-daemon image)
+        if: inputs.boot-check-expect-log != ''
+        uses: pleme-io/actions/container-boot-check@main
+        with:
+          image: ${{ inputs.boot-check-image-ref }}
+          expect-log: ${{ inputs.boot-check-expect-log }}
+          env: ${{ inputs.boot-check-env }}
+
+      - name: Correctness gate (boot-check — exec-poll a health-cmd inside the container)
+        if: inputs.boot-check-cmd != '' && !inputs.boot-check-still-running && inputs.boot-check-expect-log == ''
+        uses: pleme-io/actions/container-boot-check@main
+        with:
+          image: ${{ inputs.boot-check-image-ref }}
+          health-cmd: ${{ inputs.boot-check-cmd }}
+          env: ${{ inputs.boot-check-env }}
+
+      - name: Correctness gate (boot-check — still-running, shell-less/distroless image)
+        if: inputs.boot-check-still-running && inputs.boot-check-expect-log == ''
+        uses: pleme-io/actions/container-boot-check@main
+        with:
+          image: ${{ inputs.boot-check-image-ref }}
+          # Empty health-cmd -> container-boot-check's `docker inspect
+          # .State.Running` fallback: no `docker exec sh -c` (a distroless image
+          # has no shell), just "did the container stay up through the window".
+          health-cmd: ""
+          env: ${{ inputs.boot-check-env }}
+
+      # Token-resolution overlay: BOT_PAT > GHCR_TOKEN > GITHUB_TOKEN lives
+      # ONCE in the registry-login action (client: docker → ~/.docker/config.json,
+      # the standard keychain forge image-release's DOCA push reads via doca's
+      # `docker_config_credentials`). Said "skopeo/regctl" until 2026-08-01; both
+      # forge push paths are doca now (push.rs and image_release.rs carry ZERO
+      # executable skopeo references, measured).
+      - name: Registry login
+        uses: pleme-io/actions/registry-login@main
+        with:
+          registry: ${{ inputs.registry-host }}
+          client: docker
+          username: ${{ github.actor }}
+          bot-pat: ${{ secrets.BOT_PAT }}
+          ghcr-token: ${{ secrets.GHCR_TOKEN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # RETIRED 2026-08-01 — the `skopeo registries.conf` step lived here.
+      #
+      # It wrote a minimal v2 registries.conf and exported
+      # CONTAINERS_REGISTRIES_CONF, because the nixpkgs skopeo forge used to
+      # shell out to rejects the ubuntu runner's v1 file. Nothing reads that
+      # variable any more:
+      #   * forge's push.rs and image_release.rs carry ZERO executable skopeo
+      #     references (both are doca -- 4 and 23 oci-push references)
+      #   * substrate's own mkPushApp exports DOCA_BIN, not SKOPEO_BIN
+      #     (lib/service/platform-service.nix)
+      #   * CONTAINERS_REGISTRIES_CONF had no other consumer in this workflow
+      # so the step configured a tool that is no longer in the path, in the
+      # release lane of EVERY hardened image. Vestigial setup is not free: it
+      # is the load-bearing evidence a reader uses to conclude "the push uses
+      # skopeo", which is how the two stale comments above and below it
+      # survived the conversion.
+      #
+      # Registry login stays: `client: docker` writes ~/.docker/config.json,
+      # which doca reads through its own `docker_config_credentials` path.
+
+      # In scan-before-push mode the image derivation is already realized
+      # from the build step above, so this is a fast no-rebuild push (a
+      # cache-hit resolve + the mkPushApp DOCA copy), not a second build.
+      - name: Build + push image (idempotent — <arch>-<sha> + <arch>-latest tags)
+        env:
+          RELEASE_APP: ${{ inputs.release-app }}
+        run: nix run ".#${RELEASE_APP}"
+
+      # Supply-chain attestation, AFTER the push: an SBOM (syft) generated
+      # from the same local tarball scan-before-push already cleared, cosign-
+      # attested to the now-real, now-pushed image ref (attestation needs a
+      # registry ref Rekor's transparency log can record against -- there is
+      # nothing to attest before the push exists). Uses this job's own
+      # ambient GitHub Actions OIDC token (COSIGN_EXPERIMENTAL=1, no
+      # long-lived key) -- the id-token: write permission above is what
+      # makes that token available to request.
+      - name: SBOM + cosign attest (supply-chain evidence for the pushed image)
+        if: inputs.sbom-attest
+        env:
+          SBOM_ATTEST_APP: ${{ inputs.sbom-attest-app }}
+          COSIGN_EXPERIMENTAL: "1"
+        run: nix run ".#${SBOM_ATTEST_APP}"
+
+      # Keyless cosign signature on the pushed ref -- same ambient OIDC as
+      # the SBOM attestation above, a separate step so a consumer can opt
+      # into signing without also generating an SBOM (or vice versa).
+      - name: Cosign sign (keyless, Fulcio + Rekor)
+        if: inputs.cosign-sign
+        env:
+          COSIGN_SIGN_APP: ${{ inputs.cosign-sign-app }}
+          COSIGN_EXPERIMENTAL: "1"
+        run: nix run ".#${COSIGN_SIGN_APP}"
+
+      # FedRAMP three-pillar delivery receipt (cartorio: BLAKE3 chain link + a
+      # CycloneDX SBOM from the Nix closure + SLSA v1.0 provenance), AFTER the
+      # push. The SBOM's ROBUST source is the image's own closureInfo
+      # (cartorio-closure-info-attr) -- a compressed dockerTools tarball's own
+      # Nix-registered references are near-empty, so scanning the image
+      # out-path yields an empty SBOM, whereas closureInfo's uncompressed
+      # `store-paths` listing is always complete (see cartorio-attest's own
+      # `nix-closure-info-path` input warning). Cheap by construction: the
+      # closure was ALREADY realized locally by scan-before-push's `nix build
+      # .#<image-attr>` above (dockerTools copies the package + extraContents
+      # into the image, so their whole closure sits in the local store), so
+      # this `nix build` is a cache-hit resolve, never a recompile. Attestation
+      # lives HERE where the bytes are genuinely built -- a pulled image
+      # downstream cannot re-derive this closure. sign / emit-outcome-chain are
+      # honest LiveTODOs (false); image-digest cross-job plumbing is a LiveTODO
+      # (the exact pinned scan-image-ref is the recorded coordinate, matching
+      # the customer-facing image pipeline's own cartorio leg).
+      - name: Build image closure info (cartorio SBOM source — local cache hit, no recompile)
+        if: inputs.cartorio-attest
+        env:
+          CARTORIO_CLOSURE_INFO_ATTR: ${{ inputs.cartorio-closure-info-attr }}
+        run: nix build ".#${CARTORIO_CLOSURE_INFO_ATTR}" --out-link cartorio-closure --print-build-logs
+      - name: Cartorio attest (BLAKE3 receipt + Nix-closure SBOM + SLSA provenance)
+        if: inputs.cartorio-attest
+        uses: pleme-io/actions/cartorio-attest@main
+        with:
+          subject: ${{ inputs.cartorio-subject }}
+          image-ref: ${{ inputs.scan-image-ref }}
+          nix-closure-info-path: cartorio-closure
+          sign: "false"
+          emit-outcome-chain: "false"
+      - name: Upload cartorio receipt + SBOM + SLSA provenance
+        if: inputs.cartorio-attest
+        uses: actions/upload-artifact@v4
+        with:
+          name: cartorio-${{ inputs.cartorio-subject }}
+          path: |
+            cartorio-receipt.json
+            cartorio-sbom.cdx.json
+            cartorio-slsa.json
+          if-no-files-found: warn

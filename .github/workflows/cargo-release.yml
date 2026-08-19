@@ -1,0 +1,63 @@
+# Reusable workflow: tag-triggered crates.io release for a Rust crate.
+#
+# Usage (from a consumer repo, .github/workflows/release.yml):
+#
+#   on:
+#     push:
+#       tags: ['v*']
+#
+#   jobs:
+#     crate:
+#       uses: pleme-io/substrate/.github/workflows/cargo-release.yml@main
+#       secrets:
+#         CRATES_API_TOKEN: ${{ secrets.CRATES_API_TOKEN }}
+#
+# Mirrors the shape of gem-release.yml: derive-version pulls the
+# version from the tag, then a publish job runs cargo publish via
+# the existing crates-publish.yml reusable.
+#
+# For workspace crates, the consumer's release.yml may need to
+# orchestrate publish order — this workflow handles a single crate.
+
+name: cargo-release
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        description: "Runner label"
+        type: string
+        default: "ubuntu-24.04"
+    secrets:
+      CRATES_API_TOKEN:
+        # required:false, deliberately — this is the same defect
+        # cargo-auto-release.yml already documents. GitHub validates the WHOLE
+        # reusable call graph at STARTUP, before any job `if:` is evaluated, so
+        # `required: true` fails the caller with zero jobs and no step output.
+        # On GitHub Free an ORG secret reaches PUBLIC repos only, so every
+        # PRIVATE caller's `secrets: inherit` passes nothing here and trips it
+        # — measured 2026-08-08 on pleme-io/caixa-url:
+        #   Error when evaluating 'secrets'. Secret CRATES_API_TOKEN is required,
+        #   but not provided while calling.
+        # A startup failure names no repo and runs no step, which reads as
+        # "autorelease is broken". Absence is caught at USE time instead, where
+        # the error can name the secret and the repo missing it.
+        description: "crates.io API token with publish permission"
+        required: false
+
+jobs:
+  derive-version:
+    name: Derive crate version from tag
+    runs-on: ${{ inputs.runner }}
+    outputs:
+      version: ${{ steps.derive.outputs.version }}
+    steps:
+      - id: derive
+        uses: pleme-io/actions/derive-version-from-tag@main
+
+  publish:
+    name: Publish to crates.io
+    needs: derive-version
+    uses: pleme-io/substrate/.github/workflows/crates-publish.yml@main
+    secrets:
+      CRATES_API_TOKEN: ${{ secrets.CRATES_API_TOKEN }}

@@ -1,0 +1,137 @@
+# Ansible collection integration-live -- reusable composite workflow (Layer 2).
+#
+# Backend choice: a public `akeyless/base:latest-alpine` image does NOT exist on
+# Docker Hub (verified 2026-05-21; only `akeyless/base:latest`, `:1.0.30`,
+# `:latest-akeyless` variants are published, none Alpine-flavored). Standing up
+# the full akeyless gateway as a service container would also require licensed
+# bootstrap credentials. We therefore back integration-live with a Python mock
+# server (stdlib http.server) that responds to the akeyless REST surface the
+# example playbooks exercise.
+#
+# What this workflow proves:
+#   1. The collection BUILDS via `ansible-galaxy collection build`.
+#   2. The built tarball INSTALLS via `ansible-galaxy collection install`.
+#   3. Every example playbook PARSES + passes `ansible-playbook --check`
+#      against the mock gateway. Any module name typo / FQCN mismatch /
+#      missing dependency / invalid task syntax fails the workflow.
+#
+# When the user later wires a real gateway (licensed, with bootstrap creds in
+# secrets), swap this composite's `Start mock gateway` step for a `services:`
+# block on the akeyless image and the rest of the workflow stays identical.
+
+name: Ansible collection integration-live
+
+on:
+  workflow_call: {}
+
+jobs:
+  live:
+    # A reusable workflow's `runs-on` executes in the CALLER's billing
+    # context, so a bare metered label here charges every PRIVATE consumer.
+    # That is what exhausted the org's Actions spending limit on 2026-08-08,
+    # after which every private repo's release path failed INSTANTLY with
+    # zero steps — which reads as "autobump/autorelease is broken" rather
+    # than "billing blocked". Public callers keep the exact label they had.
+    runs-on: ${{ github.event.repository.private && 'camelot-builder-pleme-eks' || 'ubuntu-latest' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install ansible + collection runtime deps
+        shell: bash
+        run: |
+          pip install --upgrade pip
+          pip install ansible 'akeyless>=5.0.22' pyyaml
+
+      # Build + install the collection so examples that reference
+      # `drzln0.akeyless.<module>` actually resolve. Without this step
+      # ansible reports "No module named 'ansible_collections.drzln0'"
+      # and the --check below would have nothing to validate against.
+      - name: Build + install collection locally
+        shell: bash
+        run: |
+          set -euo pipefail
+          ansible-galaxy collection build --force --output-path .build
+          tarball=$(ls -1 .build/*.tar.gz | head -n1)
+          if [ -z "$tarball" ]; then
+            echo "::error::collection build produced no tarball"
+            exit 1
+          fi
+          ansible-galaxy collection install "$tarball" --force
+
+      - name: Start mock akeyless gateway
+        shell: bash
+        run: |
+          mkdir -p .ci
+          cat > .ci/mock_gateway.py <<'PY'
+          import http.server, json, socketserver, sys
+          class H(http.server.BaseHTTPRequestHandler):
+              def _r(self, code=200, body=None):
+                  self.send_response(code)
+                  self.send_header('content-type', 'application/json')
+                  self.end_headers()
+                  self.wfile.write(json.dumps(body or {}).encode())
+              def do_POST(self):
+                  length = int(self.headers.get('content-length', '0') or 0)
+                  _ = self.rfile.read(length)
+                  if self.path == '/auth':
+                      return self._r(200, {'token': 't-mock'})
+                  return self._r(200, {'ok': True, 'path': self.path})
+              def log_message(self, *a, **k):
+                  return
+          port = int(sys.argv[1]) if len(sys.argv) > 1 else 18080
+          with socketserver.TCPServer(('127.0.0.1', port), H) as srv:
+              srv.serve_forever()
+          PY
+          python3 .ci/mock_gateway.py 18080 &
+          echo "AKEYLESS_GATEWAY_URL=http://127.0.0.1:18080" >> "$GITHUB_ENV"
+
+      - name: Wait for mock gateway
+        shell: bash
+        run: |
+          for i in $(seq 1 20); do
+            if curl -fsS -X POST http://127.0.0.1:18080/auth -d '{}' >/dev/null 2>&1; then
+              echo "mock ready"; exit 0
+            fi
+            sleep 0.5
+          done
+          echo "mock failed to start"; exit 1
+
+      # Real test: run every example playbook with --check. Each must
+      # successfully parse, resolve the collection's modules, and pass
+      # task syntax + arg validation. ANY example failure fails the
+      # workflow. (No more `non-fatal:` tolerance hiding broken examples.)
+      - name: Smoke example playbooks (check mode)
+        shell: bash
+        env:
+          # Mock credentials so the per-module precondition checks pass.
+          # The mock gateway accepts any auth payload; these values
+          # never leave the runner.
+          AKEYLESS_ACCESS_ID: p-mock
+          AKEYLESS_ACCESS_KEY: mock-key
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          plays=(examples/*.yml examples/*.yaml)
+          if [ ${#plays[@]} -eq 0 ]; then
+            echo "no example playbooks present -- skipping"; exit 0
+          fi
+          failures=0
+          for p in "${plays[@]}"; do
+            echo "::group::ansible-playbook --check $p"
+            if ansible-playbook --check "$p"; then
+              echo "ok: $p"
+            else
+              failures=$((failures + 1))
+              echo "::error file=$p::ansible-playbook --check failed"
+            fi
+            echo "::endgroup::"
+          done
+          if [ "$failures" -gt 0 ]; then
+            echo "::error::$failures example(s) failed --check"
+            exit 1
+          fi
+          echo "all ${#plays[@]} example(s) passed --check"

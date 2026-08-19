@@ -1,0 +1,59 @@
+name: pleme-go
+
+# TIER-2 COMPOSER for the `go` family — 3 reusables.
+#
+# Called by pleme.yml. Calling it directly also works and simply spends one
+# fewer chain level.
+#
+# WHY A SECOND TIER EXISTS: GitHub caps a workflow at 20 `uses:` calls, so one
+# file cannot dispatch to all 73 catalogued reusables. Family composers are
+# what make near-total coverage expressible — the top level dispatches to 10
+# of these instead of to 63 leaves.
+#
+# WHY ONLY *FLAT* LEAVES LIVE HERE: GitHub allows a chain of 4 workflows, so
+# consumer(1) -> pleme(2) -> pleme-go(3) -> leaf(4) is exactly 4, and legal
+# ONLY while the leaf calls no reusable of its own. Every member below was
+# verified to nest zero. The 9 reusables that DO nest (cargo-ci,
+# pre-merge-gate, cargo-release, helm-chart-release, auto-release, …) are
+# dispatched DIRECTLY from pleme.yml, because routing them through here would
+# make the chain 5 and the run would not start.
+
+on:
+  workflow_call:
+    inputs:
+      target:
+        description: "One of: go-auto-release, go-binary-release, go-gen-spec"
+        required: true
+        type: string
+
+jobs:
+  go-auto-release:
+    if: inputs.target == 'go-auto-release'
+    uses: ./.github/workflows/go-auto-release.yml
+    secrets: inherit
+
+  go-binary-release:
+    if: inputs.target == 'go-binary-release'
+    uses: ./.github/workflows/go-binary-release.yml
+    secrets: inherit
+
+  go-gen-spec:
+    if: inputs.target == 'go-gen-spec'
+    # Calls reusable-autoheal DIRECTLY rather than via go-gen-spec, to stay
+    # inside GHA's 4-level nesting cap. go-gen-spec now delegates to autoheal
+    # itself, so the hop through it would make the chain
+    #   consumer → pleme.yml → pleme-go → go-gen-spec → autoheal
+    # which is FIVE levels and fails to dispatch. Same reason as the
+    # reusable-gen-spec job in pleme-publish.yml.
+    #
+    # Keep these `with:` values identical to go-gen-spec.yml's.
+    uses: pleme-io/substrate/.github/workflows/reusable-autoheal.yml@main
+    secrets: inherit
+    with:
+      artifact: "Go.gen.lock"
+      paths: "Go.gen.lock Go.build-spec.json"
+      detect: "nix run github:pleme-io/gen -- confirm"
+      repair: "nix run github:pleme-io/gen -- build . --commit"
+      regen: "nix run github:pleme-io/gen -- build ."
+      fix-hint: "gen build . && git commit Go.gen.lock Go.build-spec.json"
+      toolchain: "nixpkgs#go"

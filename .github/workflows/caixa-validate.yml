@@ -1,0 +1,163 @@
+# Reusable workflow: validate a caixa or a caixa-monorepo without
+# publishing.
+#
+# Use this when:
+#   - the repo is a monorepo of caixas (e.g. pleme-io/programs/) where
+#     each subdir is a sub-caixa, but the whole thing publishes via git
+#     tag rather than per-sub-caixa OCI image
+#   - the repo is in early development and you want CI gating before
+#     it's ready to publish
+#   - cross-validation pull requests (no PR should publish, only check)
+#
+# What it does:
+#   1. cse-lint repo . --strict — gates against the 12 CSE invariants
+#      that `cse-lint repo` runs, out of the 14 its model declares
+#      (verified 2026-07-28 against cse-lint's own checker list at
+#      src/main.rs:266-278):
+#
+#        claude-md-pointer · hand-roll · module-trio-adoption ·
+#        caixa-naivete · gui-app-consumes-ishou · no-foreign-nord-source ·
+#        gpu-app-headless-mode · mcp-stdout-clean · scenario-corpus-present ·
+#        build-spec-canonical-url · build-spec-schema-version ·
+#        no-lockfile-builder-direct-import
+#
+#      The 2 it does NOT run are manifest-membership and
+#      deployment-coverage: both need a workspace-root view (ecosystem
+#      manifest, k8s/ tree) that single-repo CI does not have, so `repo`
+#      mode skips them by construction. This header previously claimed
+#      "the 6 CSE invariants" and then listed four — a count matching
+#      neither what runs (12) nor the model (14), and the two it would
+#      have needed to reach 6 are precisely the two that cannot run here.
+#
+#      ⚠ READING THE OUTPUT: cse-lint's report prints a histogram row for
+#      all 14 kinds, so a SKIPPED check displays as `✓ 0` identically to
+#      one that ran and passed. Do not read a `✓ 0` on
+#      manifest-membership or deployment-coverage here as evidence they
+#      were checked.
+#   2. feira dialeto — classify every caixa manifest in the tree by
+#      DIALECT, and fail on one that classifies as neither. See the
+#      "Dialect gate" note below; this step is default-on and hard.
+#   3. feira lint — manifest + Lisp parse for every declared
+#      :bibliotecas / :servicos / :exe entry
+#   4. (optional) feira build — typed structural validation of the
+#      caixa's content
+#
+# ── Dialect gate (added 2026-07-31) ──────────────────────────────────
+#
+# `defcaixa` was spoken by TWO unrelated declarations: caixa-core's
+# package manifest (`:nome :versao :kind :deps …`, read by feira) and
+# pleme-doc-gen's repo-surface declaration (`:name :ecosystem
+# :package {…} :files […]`, read by pleme-doc-gen). They share no
+# required slot. Measured over the org checkout on 2026-07-31: of 270
+# caixa manifests, 20 were package manifests and 249 were the other
+# declaration wearing the same keyword — so "a .caixa.lisp is a Caixa"
+# was false for 92% of the corpus.
+#
+# Nothing caught it, and the reason is visible in this very file's
+# history: `feira build`, the only step that would have called the real
+# parser, was `build: default: false`, and `feira lint` was
+# `|| echo "::warning"`. An opt-in check and a soft check are the same
+# thing as no check. Both are corrected below.
+#
+# The repo-surface declaration now has its own keyword, `defmolde`, and
+# pleme-doc-gen's scaffolder emits it. The legacy spelling is still
+# READ (249 live files in repos that migrate on their own schedule),
+# which is why `strictPalavra` defaults to false — but a manifest that
+# classifies as NEITHER dialect fails hard, unconditionally, and that
+# is what stops a third dialect appearing. Turn `strictPalavra` on for
+# any repo whose manifests are already migrated.
+#
+# Consumer:
+#   jobs:
+#     validate:
+#       uses: pleme-io/substrate/.github/workflows/caixa-validate.yml@main
+#       secrets: inherit
+#       permissions:
+#         contents: read
+
+name: caixa-validate
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        description: "Runner label"
+        type: string
+        default: "ubuntu-24.04"
+      strict:
+        description: "Exit non-zero on violations (vs informational)"
+        type: boolean
+        default: true
+      build:
+        description: "Also run `feira build` for structural validation"
+        type: boolean
+        default: true
+      strictPalavra:
+        description: >-
+          Also fail a repo-surface manifest still written as `(defcaixa …)`
+          rather than `(defmolde …)`. Default false ONLY because the legacy
+          corpus is live; set true once this repo's manifests are migrated.
+        type: boolean
+        default: false
+      caixaPath:
+        description: "Path inside repo where the caixa.lisp lives. Default: repo root."
+        type: string
+        default: "."
+
+jobs:
+  validate:
+    name: Validate caixa
+    runs-on: ${{ inputs.runner }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+        with:
+          github-token: ${{ secrets.BOT_PAT }}
+      - name: cse-lint repo
+        run: |
+          set -euo pipefail
+          STRICT_FLAG=""
+          if [ "${{ inputs.strict }}" = "true" ]; then
+            STRICT_FLAG="--strict"
+          fi
+          nix run github:pleme-io/cse-lint -- repo "${{ inputs.caixaPath }}" $STRICT_FLAG
+
+      # Default-on and HARD. `feira dialeto` refuses to report a clean
+      # census over a tree it found no manifests in, so a mis-pointed
+      # caixaPath fails loudly instead of greening on nothing — the
+      # vacuous-pass shape that made the previous two steps worthless.
+      - name: feira dialeto
+        run: |
+          set -euo pipefail
+          cd "${{ inputs.caixaPath }}"
+          STRICT=""
+          if [ "${{ inputs.strictPalavra }}" = "true" ]; then
+            STRICT="--strict-palavra"
+          fi
+          nix run github:pleme-io/caixa#feira -- dialeto $STRICT .
+
+      # Was `|| echo "::warning::feira lint unavailable; skipping"`. That
+      # branch reported "unavailable" for BOTH causes — the app genuinely
+      # missing, and the lint genuinely failing — so a real violation
+      # rendered as an infrastructure excuse and the job stayed green.
+      # If the app is missing, that is a broken pipeline and should fail.
+      - name: feira lint
+        run: |
+          set -euo pipefail
+          cd "${{ inputs.caixaPath }}"
+          nix run github:pleme-io/caixa#feira -- lint
+
+      # Default TRUE since 2026-07-31. This is the only step that runs the
+      # real `Caixa::from_lisp`, and it defaulted to false — which is
+      # precisely why two incompatible dialects grew to 92% of the corpus
+      # without a single red build.
+      - name: feira build (structural check)
+        if: ${{ inputs.build }}
+        run: |
+          set -euo pipefail
+          cd "${{ inputs.caixaPath }}"
+          nix run github:pleme-io/caixa#feira -- build

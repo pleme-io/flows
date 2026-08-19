@@ -1,0 +1,77 @@
+name: data-stack
+
+# Composes data pipeline primitives: dbt build + dagster materialize
+# + datadog event + grafana annotation. Use for warehouse repos.
+
+on:
+  workflow_call:
+    inputs:
+      dbt-profile:      { type: string, required: false, default: "default" }
+      dagster-asset:    { type: string, required: false, default: "" }
+    secrets:
+      DD_API_KEY:       { required: false }
+      GRAFANA_URL:      { required: false }
+      GRAFANA_TOKEN:    { required: false }
+
+permissions:
+  contents: read
+
+jobs:
+  dbt:
+    # A reusable workflow's `runs-on` executes in the CALLER's billing
+    # context, so a bare metered label here charges every PRIVATE consumer.
+    # That is what exhausted the org's Actions spending limit on 2026-08-08,
+    # after which every private repo's release path failed INSTANTLY with
+    # zero steps — which reads as "autobump/autorelease is broken" rather
+    # than "billing blocked". Public callers keep the exact label they had.
+    runs-on: ${{ github.event.repository.private && 'camelot-builder-pleme-eks' || 'ubuntu-latest' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pleme-io/actions/dbt-build@main
+        with:
+          profile: ${{ inputs.dbt-profile }}
+
+  dagster:
+    if: inputs.dagster-asset != ''
+    needs: dbt
+    # A reusable workflow's `runs-on` executes in the CALLER's billing
+    # context, so a bare metered label here charges every PRIVATE consumer.
+    # That is what exhausted the org's Actions spending limit on 2026-08-08,
+    # after which every private repo's release path failed INSTANTLY with
+    # zero steps — which reads as "autobump/autorelease is broken" rather
+    # than "billing blocked". Public callers keep the exact label they had.
+    runs-on: ${{ github.event.repository.private && 'camelot-builder-pleme-eks' || 'ubuntu-latest' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pleme-io/actions/dagster-materialize@main
+        with:
+          asset-key: ${{ inputs.dagster-asset }}
+
+  notify:
+    needs: [dbt, dagster]
+    if: always()
+    # A reusable workflow's `runs-on` executes in the CALLER's billing
+    # context, so a bare metered label here charges every PRIVATE consumer.
+    # That is what exhausted the org's Actions spending limit on 2026-08-08,
+    # after which every private repo's release path failed INSTANTLY with
+    # zero steps — which reads as "autobump/autorelease is broken" rather
+    # than "billing blocked". Public callers keep the exact label they had.
+    runs-on: ${{ github.event.repository.private && 'camelot-builder-pleme-eks' || 'ubuntu-latest' }}
+    # `secrets` is unavailable in step-level `if:` — hoist the gate
+    # secrets into job env and test `env.X` (0-job parse-failure class).
+    env:
+      DD_API_KEY: ${{ secrets.DD_API_KEY }}
+      GRAFANA_URL: ${{ secrets.GRAFANA_URL }}
+    steps:
+      - if: env.DD_API_KEY != ''
+        uses: pleme-io/actions/datadog-event@main
+        with:
+          api-key: ${{ secrets.DD_API_KEY }}
+          title: 'data-stack run'
+          text: ${{ format('dbt={0} dagster={1}', needs.dbt.result, needs.dagster.result) }}
+      - if: env.GRAFANA_URL != ''
+        uses: pleme-io/actions/grafana-annotation@main
+        with:
+          url: ${{ secrets.GRAFANA_URL }}
+          api-token: ${{ secrets.GRAFANA_TOKEN }}
+          text: 'data-stack run'

@@ -1,0 +1,93 @@
+# Reusable workflow: lint, package, and push a Helm chart to an OCI registry.
+#
+# Usage (from a consumer repo):
+#
+#   jobs:
+#     helm:
+#       uses: pleme-io/substrate/.github/workflows/helm-publish.yml@main
+#       with:
+#         chartPath: ./charts/my-chart      # default: "./charts"
+#         registry: oci://ghcr.io/pleme-io/charts  # default
+#         version: ""                       # optional; parsed from Chart.yaml
+#         libChartDir: ""                   # optional, for file:// deps (e.g. pleme-lib)
+#       secrets:
+#         GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+#
+# Strategy:
+#   - Prefers `forge helm release` (lint + package + push as one transaction).
+#   - Falls back to `helm lint && helm package && helm push` for repos that
+#     don't yet have forge available in their flake.
+#
+# Expected chart layout: a directory containing a `Chart.yaml`. If the chart
+# depends on a sibling library chart (file://...), pass libChartDir.
+
+name: helm-publish
+
+on:
+  workflow_call:
+    inputs:
+      chartPath:
+        description: "Path to the Helm chart directory (containing Chart.yaml)"
+        type: string
+        default: "./charts"
+      registry:
+        description: "OCI registry URL (oci:// scheme)"
+        type: string
+        default: "oci://ghcr.io/pleme-io/charts"
+      version:
+        description: "Override chart version; defaults to Chart.yaml's version"
+        type: string
+        default: ""
+      libChartDir:
+        description: "External library chart directory copied as a sibling for file:// deps"
+        type: string
+        default: ""
+      libChartName:
+        description: "Library chart name (passed through to forge helm release)"
+        type: string
+        default: "pleme-lib"
+      runner:
+        description: "Runner label"
+        type: string
+        default: "ubuntu-24.04"
+    secrets:
+      GHCR_TOKEN:
+        description: "Token with write:packages on the target registry. Falls back to GITHUB_TOKEN."
+        required: false
+      BOT_PAT:
+        description: "Cross-repo-scoped PAT for the Nix installer's GitHub API calls (needed when a flake input is a private pleme-io repo). Falls back to GITHUB_TOKEN."
+        required: false
+
+jobs:
+  publish:
+    name: Lint, package & push chart
+    runs-on: ${{ inputs.runner }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+        with:
+          github-token: ${{ secrets.BOT_PAT }}
+      - name: Registry login
+        env:
+          REGISTRY: ${{ inputs.registry }}
+          TOKEN: ${{ secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN || github.token }}
+        run: |
+          set -euo pipefail
+          host="${REGISTRY#oci://}"
+          host="${host%%/*}"
+          echo "$TOKEN" | nix shell nixpkgs#kubernetes-helm --command \
+            helm registry login "$host" --username "${{ github.actor }}" --password-stdin
+
+      - name: Lint, package & push chart
+        uses: pleme-io/actions/helm-oci-publish@main
+        with:
+          chart-path:     ${{ inputs.chartPath }}
+          registry:       ${{ inputs.registry }}
+          version:        ${{ inputs.version }}
+          lib-chart-dir:  ${{ inputs.libChartDir }}
+          lib-chart-name: ${{ inputs.libChartName }}

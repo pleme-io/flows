@@ -1,0 +1,73 @@
+# go-gen-spec — Go build-spec + Go.gen.lock maintenance.
+#
+# A thin caller of `reusable-autoheal.yml`. The skeleton this file used to
+# carry by hand — checkout, nix, regenerate, fail-the-PR, push back — is the
+# AUTOHEAL quality and now lives in exactly one place. See that file's header
+# for why: fourteen workflows carried this shape and each re-decided the runner,
+# eight of them onto a pool that had stalled.
+#
+# Consumers are unchanged. A Go-module repo still adopts it with:
+#
+#   # .github/workflows/go-gen-spec.yml
+#   name: go-gen-spec
+#   on:
+#     push: { branches: [main], paths: ["**/go.mod", "**/go.sum"] }
+#     pull_request: { paths: ["**/go.mod", "**/go.sum"] }
+#   jobs:
+#     go-gen-spec:
+#       uses: pleme-io/substrate/.github/workflows/go-gen-spec.yml@main
+#       secrets: inherit
+#
+# TWO THINGS THIS GAINS by delegating, both of which it lacked (2026-08-06):
+#
+#   1. A FRESHNESS GATE. This workflow had none — it could only ever say "the
+#      regen changed something", and only after a full `go list` resolution had
+#      already run. `gen confirm` reads go.sum + the committed Go.gen.lock and
+#      returns a verdict offline, in milliseconds, before anything expensive.
+#      Measured: the cargo sibling had this and Go did not.
+#
+#   2. EVENT TOTALITY. Its push arm matched only `push`, and its PR arm only
+#      `pull_request`, so a `workflow_dispatch` from a caller matched NEITHER —
+#      every step skipped and the job reported SUCCESS having done nothing.
+#      That is the same fake-green the cargo sibling hit live and fixed; this
+#      file still had the hole. The shared workflow now refuses an unhandled
+#      event instead of skipping it.
+#
+# `gen build . --commit` auto-detects go.mod and regenerates BOTH the full
+# Go.build-spec.json and the slim Go.gen.lock delta, committing atomically as
+# gen-spec-bot and no-op when fresh.
+#
+# NOTE: Go support requires a published gen carrying the gomod adapter — pin
+# `gen-ref` to a rev that has it if the default does not.
+name: go-gen-spec
+
+on:
+  workflow_call:
+    inputs:
+      gen-ref:
+        description: "gen flake ref to run (pin for reproducibility)."
+        type: string
+        default: "github:pleme-io/gen"
+      runner:
+        description: "Runner override; empty uses the shared default."
+        type: string
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  go-gen-spec:
+    # Fully-qualified, not `./…`: this workflow is itself called from another
+    # repo, and the fleet's 109 other nested calls all use this form. A relative
+    # path resolves against the CALLER's checkout, which is not substrate.
+    uses: pleme-io/substrate/.github/workflows/reusable-autoheal.yml@main
+    secrets: inherit
+    with:
+      artifact: "Go.gen.lock"
+      paths: "Go.gen.lock Go.build-spec.json"
+      detect: "nix run ${{ inputs.gen-ref }} -- confirm"
+      repair: "nix run ${{ inputs.gen-ref }} -- build . --commit"
+      regen: "nix run ${{ inputs.gen-ref }} -- build ."
+      fix-hint: "gen build . --commit"
+      runner: ${{ inputs.runner }}

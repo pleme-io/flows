@@ -1,0 +1,287 @@
+name: auto-release
+
+# Polymorphic auto-release. Detects the repo type at the start
+# (via pleme-io/actions/detect-repo-type) + dispatches to the
+# appropriate per-type pipeline (bump + commit + tag + push +
+# publish). Every pleme-io repo regardless of language uses the
+# same 3-line consumer shim:
+#
+#   on: { push: { branches: [main] } }
+#   jobs:
+#     release:
+#       uses: pleme-io/substrate/.github/workflows/auto-release.yml@main
+#       secrets: inherit
+#
+# The repo type is inferred from manifest presence:
+#   Cargo.toml + [workspace]  → rust-workspace
+#   Cargo.toml + [package]    → rust-single-crate
+#   go.mod                    → go (pull-model module, FSM-MODULE)
+#   pyproject.toml            → python
+#   package.json              → npm
+#   Chart.yaml                → helm
+#
+# Each per-type job is gated by the detect output; only one
+# branch runs per invocation.
+#
+# secrets: inherit at every layer — propagates whatever the
+# operator's repo has access to without having to enumerate per-
+# language-specific tokens here.
+
+on:
+  workflow_call:
+    inputs:
+      bump-type:
+        type: string
+        required: false
+        default: patch
+      # Runner routing: empty default routes by CALLER repo visibility —
+      # private repos → the org-scoped camelot-builder-pleme-eks ARC pool (avoids billed
+      # hosted minutes; org runner groups refuse public repos anyway), public
+      # repos → ubuntu-latest. Schedule-triggered callers may lack
+      # github.event.repository and fall open to hosted (documented edge).
+      # Passed through verbatim to every per-language reusable below.
+      runner:
+        description: "Explicit runner label override; empty = route by caller repo visibility (private → camelot-builder-pleme-eks, public → ubuntu-latest)."
+        type: string
+        required: false
+        default: ""
+    secrets:
+      # DECLARED EXPLICITLY, ALL OPTIONAL — this block is the fix for the
+      # startup_failure that made this whole workflow unusable.
+      #
+      # Previously there was no `secrets:` block at all: the consumer's
+      # `secrets: inherit` fanned out to six per-language reusables, four of
+      # which declare their token `required: true` (cargo + rust
+      # CRATES_API_TOKEN, npm NPM_TOKEN, python PYPI_API_TOKEN). GitHub
+      # resolves the whole called-workflow graph before evaluating any job's
+      # `if:`, so every consumer had to satisfy the UNION of those four — and
+      # a run that cannot be built emits no error, just a run with zero jobs.
+      #
+      # Measured 2026-07-27, which is what turns this from inference into a
+      # diagnosis: `gh api orgs/pleme-io/actions/secrets` returns exactly AGE,
+      # BOT_PAT, CRATES_API_TOKEN and RUBYGEMS_API_KEY. NPM_TOKEN and
+      # PYPI_API_TOKEN exist in NO org and NO repo. The union was therefore
+      # unsatisfiable everywhere, which is precisely why the 1-level direct
+      # calls kept working: 371 repos call cargo-auto-release.yml, which needs
+      # only CRATES_API_TOKEN, and that one IS org-wide.
+      #
+      # Declaring them here makes each one AVAILABLE-BUT-OPTIONAL at this
+      # level, so the arms' `secrets: inherit` passes a declared (possibly
+      # empty) value rather than leaving the graph with an unsatisfiable
+      # constraint. A publish that genuinely needs a missing token now fails AT
+      # PUBLISH with a legible error, instead of the whole run silently never
+      # starting. The arms keep `inherit` deliberately: enumerating per-arm
+      # would add a fifth place to keep in sync every time a reusable's secret
+      # set changes, which is the drift class that produced `crate-path`'s
+      # source-paths/add-paths bug.
+      #
+      # TIER-HONEST: the DIAGNOSIS is confirmed by the org-secret measurement
+      # above. This FIX's efficacy is not yet observed — GitHub's exact
+      # graph-build semantics for `inherit` over a declared-optional secret is
+      # inferred, not proven. Confirm with one live run: a consumer's run must
+      # start WITH JOBS (the failure mode is a run created with zero jobs and
+      # no annotations). If it still fails, the fallback is to make the four
+      # per-language reusables' own tokens `required: false` — same effect,
+      # four more files touched.
+      CRATES_API_TOKEN:
+        description: "crates.io publish token. Org-wide today; required only by the rust/cargo arms."
+        required: false
+      NPM_TOKEN:
+        description: "npmjs.org publish token. Does not exist in the org as of 2026-07-27 — the npm class is 32 repos with zero release workflows, so this is declared for completeness, not because publishing is wired."
+        required: false
+      PYPI_API_TOKEN:
+        description: "pypi.org publish token. Does not exist in the org as of 2026-07-27."
+        required: false
+      BOT_PAT:
+        description: "Org PAT used for push-back of the version bump. Org-wide."
+        required: false
+      ANSIBLE_GALAXY_TOKEN:
+        description: "ansible-galaxy publish token. Its reusable already declares it required:false, so its absence never blocked the graph — declared here so the ansible arm's `inherit` can actually carry it if the secret is ever added."
+        required: false
+
+# A called workflow's GITHUB_TOKEN scopes may only be EQUAL OR MORE RESTRICTIVE
+# than its caller's. GitHub validates that across the whole graph while BUILDING
+# the run — before any job `if:` is evaluated — so one arm asking for a scope
+# this block omits rejects the entire run: zero jobs, `startup_failure`, no
+# annotations, and nothing in `gh run view --log` (the reason is UI-banner-only,
+# which is why this stayed invisible).
+#
+# `packages: write` is here for the helm arm (helm-auto-release.yml:41-43),
+# which pushes the chart to ghcr.io with GITHUB_TOKEN when BOT_PAT is absent.
+# Every consumer of this dispatcher had been failing at startup since the helm
+# arm was added in 4674679 (2026-05-22) — the earliest recorded consumer run,
+# caixa-tlisp-core 26353521870 on 2026-05-24, already startup_failed. It never
+# worked once. 925c4d7 and 6634fa6 both targeted this symptom and neither
+# touched permissions, which is why neither changed anything.
+#
+# Proof it is this and not resolution: the run's `referenced_workflows` lists
+# all ten files at the right sha, so every arm WAS found and parsed. And the
+# bisect probe auto-release-min.yml (87870fc1) — same shape, helm arm omitted,
+# same `contents: write` — succeeded.
+#
+# Adding an arm that needs a NEW scope means widening this block in the same
+# commit, or giving that arm a job-level `permissions:` block.
+permissions:
+  contents: write
+  packages: write
+
+# Serialize releases per repository — two pushes to main otherwise race two
+# bump runs from the same base and the second push is rejected non-ff (its
+# bump lost). Queue rather than cancel; an in-flight release must finish.
+# This is the canonical entrypoint (the 3-line consumer shim), so its
+# concurrency is the one GitHub honors for repos using the polymorphic flow.
+concurrency:
+  group: auto-release-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  detect:
+    name: Detect repo type
+    runs-on: ${{ inputs.runner != '' && inputs.runner || (github.event.repository.private && 'camelot-builder-pleme-eks' || 'ubuntu-latest') }}
+    outputs:
+      repo-type: ${{ steps.detect.outputs.repo-type }}
+      manifest-path: ${{ steps.detect.outputs.manifest-path }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: detect
+        uses: pleme-io/actions/detect-repo-type@main
+
+  rust-workspace:
+    name: 'rust-workspace · release'
+    needs: detect
+    if: needs.detect.outputs.repo-type == 'rust-workspace'
+    uses: pleme-io/substrate/.github/workflows/rust-auto-release.yml@main
+    with:
+      bump-type: ${{ inputs.bump-type }}
+      runner: ${{ inputs.runner }}
+    secrets: inherit
+
+  rust-single-crate:
+    name: 'rust-single-crate · release'
+    needs: detect
+    if: needs.detect.outputs.repo-type == 'rust-single-crate'
+    uses: pleme-io/substrate/.github/workflows/cargo-auto-release.yml@main
+    with:
+      bump-type: ${{ inputs.bump-type }}
+      runner: ${{ inputs.runner }}
+    secrets: inherit
+
+  go:
+    name: 'go · release'
+    needs: detect
+    if: needs.detect.outputs.repo-type == 'go'
+    # FSM-MODULE: pull-model, tag-only — go-auto-release.yml's only publish
+    # side effect is the tag push; proxy.golang.org indexes lazily.
+    uses: pleme-io/substrate/.github/workflows/go-auto-release.yml@main
+    with:
+      bump-type: ${{ inputs.bump-type }}
+      runner: ${{ inputs.runner }}
+    secrets: inherit
+
+  npm:
+    name: 'npm · release'
+    needs: detect
+    if: needs.detect.outputs.repo-type == 'npm'
+    uses: pleme-io/substrate/.github/workflows/npm-auto-release.yml@main
+    with:
+      bump-type: ${{ inputs.bump-type }}
+      runner: ${{ inputs.runner }}
+    secrets: inherit
+
+  python:
+    name: 'python · release'
+    needs: detect
+    if: needs.detect.outputs.repo-type == 'python'
+    uses: pleme-io/substrate/.github/workflows/python-auto-release.yml@main
+    with:
+      bump-type: ${{ inputs.bump-type }}
+      runner: ${{ inputs.runner }}
+    secrets: inherit
+
+  helm:
+    name: 'helm · release'
+    needs: detect
+    if: needs.detect.outputs.repo-type == 'helm'
+    uses: pleme-io/substrate/.github/workflows/helm-auto-release.yml@main
+    with:
+      bump-type: ${{ inputs.bump-type }}
+      runner: ${{ inputs.runner }}
+    secrets: inherit
+
+  ansible-collection:
+    name: 'ansible-collection · release'
+    needs: detect
+    if: needs.detect.outputs.repo-type == 'ansible-collection'
+    uses: pleme-io/substrate/.github/workflows/ansible-collection-release.yml@main
+    secrets: inherit
+
+  github-action:
+    name: 'github-action · release'
+    needs: detect
+    if: needs.detect.outputs.repo-type == 'github-action'
+    uses: pleme-io/substrate/.github/workflows/action-release.yml@main
+    secrets: inherit
+
+  # caixa — a pure-tatara-lisp library (Biblioteca). Delivery is tag-only: a
+  # consumer INLINES the library's stdlib.tlisp, so the deliverable is the
+  # tagged manifest, whose :files entries carry each shipped file's sha256,
+  # size and body. caixa-bump refreshes those alongside the version, because a
+  # version bump alone would tag a release carrying the previous revision's
+  # content.
+  caixa:
+    name: 'caixa · release'
+    needs: detect
+    if: needs.detect.outputs.repo-type == 'caixa'
+    uses: pleme-io/substrate/.github/workflows/caixa-tlisp-auto-release.yml@main
+    secrets: inherit
+
+  # Catch-all. MUST be a NEGATION of the dispatched set, never `== 'unknown'`.
+  #
+  # detect-repo-type emits TEN types (actions/detect-repo-type/run.tlisp):
+  #   rust-workspace rust-single-crate go ansible-collection helm python npm
+  #   ruby-gem github-action caixa unknown
+  # Before 2026-07-27 this job gated on `== 'unknown'` — an equality test, not a
+  # negation — while only SIX arms existed. A repo detected as `ruby-gem`,
+  # `ansible-collection` or `github-action` therefore matched no arm AND did not
+  # match this one, so the workflow completed with zero jobs and reported GREEN
+  # while publishing nothing. That is a green gate over zero subjects: the
+  # Tier-⊥ vacuous-guard class the fleet's own UNREPRESENTABILITY doctrine names.
+  #
+  # `ruby-gem` is deliberately NOT an arm above. gem-release.yml declares
+  # RUBYGEMS_API_KEY as `required: true`, and adding it here would re-create the
+  # very union-of-required-secrets unsatisfiability that makes this polymorphic
+  # workflow startup_failure. The gem flow stays standalone + tag-triggered (see
+  # the org CLAUDE.md AUTO-RELEASE section); gem repos get a specific, actionable
+  # error below rather than a silent green.
+  unsupported:
+    name: 'unsupported repo type'
+    needs: detect
+    if: >-
+      needs.detect.outputs.repo-type != 'rust-workspace' &&
+      needs.detect.outputs.repo-type != 'rust-single-crate' &&
+      needs.detect.outputs.repo-type != 'go' &&
+      needs.detect.outputs.repo-type != 'npm' &&
+      needs.detect.outputs.repo-type != 'python' &&
+      needs.detect.outputs.repo-type != 'helm' &&
+      needs.detect.outputs.repo-type != 'ansible-collection' &&
+      needs.detect.outputs.repo-type != 'github-action' &&
+      needs.detect.outputs.repo-type != 'caixa'
+    runs-on: ${{ inputs.runner != '' && inputs.runner || (github.event.repository.private && 'camelot-builder-pleme-eks' || 'ubuntu-latest') }}
+    steps:
+      - name: Fail with diagnostic
+        env:
+          REPO_TYPE: ${{ needs.detect.outputs.repo-type }}
+        run: |
+          if [ "$REPO_TYPE" = "ruby-gem" ]; then
+            echo "::error::ruby-gem repos do not use the polymorphic auto-release."
+            echo "::error::Call gem-auto-bump.yml@main and gem-release.yml@main directly."
+            echo "::error::gem-release.yml needs a named RUBYGEMS_API_KEY secret, which"
+            echo "::error::the single-shot 'secrets: inherit' arm contract cannot carry."
+          elif [ "$REPO_TYPE" = "unknown" ]; then
+            echo "::error::detect-repo-type returned 'unknown' — no manifest at root recognized"
+            echo "::error::see pleme-io/actions/detect-repo-type for the supported manifest list"
+          else
+            echo "::error::repo-type '$REPO_TYPE' is emitted by detect-repo-type but has no"
+            echo "::error::dispatch arm in auto-release.yml. Add one, or route it explicitly."
+          fi
+          exit 1

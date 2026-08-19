@@ -1,0 +1,222 @@
+# Reusable workflow: run `cargo test` inside a named nix devShell, on a
+# real Linux runner, instead of a bare-toolchain job that happens to work
+# because the runner's ambient system libraries (Ruby, OpenSSL, libclang,
+# whatever the crate embeds) are accidentally compatible.
+#
+# Use this whenever a crate's tests depend on something a nix devShell
+# already provides hermetically (an embedded interpreter via FFI, a
+# specific native library version, a pinned toolchain) — the alternative
+# is a `dtolnay/rust-toolchain@stable` + bare `cargo test` job that passes
+# today only because `ubuntu-latest`'s own ambient environment happens to
+# satisfy the requirement, with no pin and no guarantee it keeps doing so.
+#
+# First consumer: pangea-operator, whose embedded-Ruby (magnus/rb-sys)
+# link requirement was, until this workflow, satisfied only by luck
+# against ubuntu-latest's system Ruby — no local devShell equivalent
+# worked on darwin either, since `.#ruby-eval`'s bindgen args assume a
+# glibc `.dev` output that only a Linux nixpkgs stdenv provides. This
+# workflow runs that same devShell on the one environment it's actually
+# built for (a Linux nix daemon), closing the gap between "works by
+# accident in CI" and "works because it's pinned."
+#
+# Consumer (.github/workflows/ci.yml):
+#
+#   jobs:
+#     cargo-test:
+#       uses: pleme-io/substrate/.github/workflows/nix-devshell-cargo-test.yml@main
+#       with:
+#         devshell: ruby-eval
+#       secrets: inherit
+
+name: nix-devshell-cargo-test
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        # Empty = route by CALLER repo visibility. The old default was a
+        # literal "ubuntu-24.04", which silently billed GitHub-hosted minutes
+        # for every PRIVATE consumer — the exact outcome the org invariant in
+        # `pleme-io/actions/runner-resolve` forbids ("a CI path either flows
+        # through a genuinely public repo or Camelot self-hosted, never a
+        # metered GitHub-hosted runner on a private repo"). frost and seki
+        # both inherited it, and on 2026-08-08 that class of pin exhausted the
+        # org's Actions spending limit, blocking every private repo in
+        # pleme-io. A default that costs money on a private repo is not a
+        # neutral default.
+        description: "Runner label; empty routes by caller repo visibility (private -> camelot-builder-pleme-eks, public -> ubuntu-24.04)"
+        type: string
+        default: ""
+      devshell:
+        description: "Flake devShell output name (e.g. `.#ruby-eval`)"
+        type: string
+        required: true
+      test-args:
+        description: "Args appended to `cargo test` inside the devShell"
+        type: string
+        default: "--workspace --no-fail-fast"
+      fmt-check:
+        description: >-
+          Run `cargo fmt --all -- --check` in the same devShell, before the
+          tests.
+
+          This gate exists because its absence was measured. magma had
+          `cargo fmt --all -- --check` in a hand-written job; adopting this
+          reusable (2026-08-01) DROPPED it, because nothing here replaced
+          it. Thirty-four files had already drifted out of format during the
+          repo's Actions blackout, and nothing would have caught the next
+          thirty-four. A gate that exists in a workflow nobody runs, then
+          vanishes in the migration to one that does, is a silent net loss.
+
+          Runs BEFORE `cargo test` on purpose: it is seconds, needs no
+          network, and a red fmt on a green suite is a clearer signal than
+          the reverse ordering gives. It is a separate step, not `&&`-joined
+          to the test command, so the two failures stay distinguishable in
+          the Actions UI.
+
+          Default `true` — this is the fleet standard, and a repo that fails
+          it is carrying real debt that one `cargo fmt --all` clears. Set
+          `false` only for a vendor mirror whose formatting is upstream's to
+          own.
+        type: boolean
+        default: true
+      devshell-args:
+        description: >-
+          Extra arguments passed to `nix develop` itself (NOT to `cargo
+          test` — that is `test-args`). Empty by default, so every existing
+          caller runs the exact same command as before.
+
+          This input exists because `lib/util/devshell-preflight.nix` has
+          been telling operators to use it since 2026-07-28 — its lever #2
+          prints `devshell-args: "--impure"` — while the input did not
+          exist. A remediation message naming a knob that cannot be set is
+          not a remediation.
+
+          The one known use is `--impure`, for a flake whose devShell is
+          DELIBERATELY devenv-backed: devenv asserts on the working
+          directory, which is empty under a non-interactive `nix develop`.
+
+          ⚠ MEASURED 2026-07-28 ON `forge`, so nobody re-derives it the
+          hard way: `--impure` alone is NOT sufficient. It clears the
+          working-directory assertion and then surfaces the next one —
+          `error: To use 'languages.rust.channel', Add … inputs.rust-overlay.url`
+          — because devenv's Rust module resolves a `rust-overlay` input the
+          consumer never declared. Passing `--impure` is half a fix; the
+          flake must also declare that input. The preflight step below says
+          so at the point of failure.
+
+          Deliberately NOT wired to `cargo-ci.yml`'s `flake-args`. That input
+          means "extra args for `nix flake check`"; forwarding it here would
+          silently give one string two jobs' worth of meaning, and the
+          measurement above shows it would not even work — a caller passing
+          `--impure` for the flake-check leg would get a different opaque red
+          on this leg rather than a green.
+        required: false
+        type: string
+        default: ""
+
+jobs:
+  cargo-test:
+    name: cargo test (nix devShell ${{ inputs.devshell }})
+    # ubuntu-24.04 rather than -latest for the PUBLIC arm: tatara-script's
+    # release binary is linked against glibc 2.39 and dies instantly on
+    # 22.04's 2.35, so the floor is pinned rather than floating.
+    runs-on: ${{ inputs.runner != '' && inputs.runner || (github.event.repository.private && 'camelot-builder-pleme-eks' || 'ubuntu-24.04') }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+        with:
+          github-token: ${{ secrets.BOT_PAT }}
+      # magic-nix-cache-action is EOL'd upstream (repo-scoped, can't carry a
+      # fleet closure -- purify skill's own standing guidance) and outright
+      # broken on a self-hosted ARC runner (`xz: not found` unpacking its
+      # own cache blob), failing this job's first real step on every push
+      # that reaches it (2026-07-25). Same bug, same fix as
+      # pangea-operator/.github/workflows/ci.yml's own flake-check job:
+      # dropped rather than patched.
+
+      # ── Private git-dependency credential (2026-07-25) ──────────────────
+      # A consumer whose Cargo.toml pulls a private pleme-io git dependency
+      # directly (`tsunagu = { git = "https://github.com/pleme-io/..." }`)
+      # fails inside the devShell's `cargo test` with "failed to
+      # authenticate when downloading repository" -- nix-installer-action's
+      # own github-token above only covers NIX's fetcher (flake inputs),
+      # never CARGO's separate git-dependency resolution, so this gap was
+      # unconditional on every consumer with a private Cargo git dep, not
+      # pangea-operator-specific. Same fix as release.yml's own
+      # ccfd349/32b16bd precedent: unset actions/checkout's THIS-repo-scoped
+      # extraheader (it silently wins over url.insteadOf by prefix match if
+      # left in place) and route github.com through BOT_PAT instead.
+      - name: Configure git credentials for private git dependencies (cargo)
+        env:
+          GIT_AUTH_TOKEN: ${{ secrets.BOT_PAT }}
+        run: |
+          git config --global url."https://x-access-token:${GIT_AUTH_TOKEN}@github.com/".insteadOf "https://github.com/"
+          git config --unset-all http.https://github.com/.extraheader || true
+
+      # ── devShell preflight (wired 2026-07-28) ──────────────────────────
+      #
+      # WHY THIS STEP EXISTS: without it, the only thing standing between a
+      # consumer and a completely opaque red is `nix develop` itself. When
+      # the devShell cannot be entered, nix fails with an evaluation trace
+      # before cargo is ever invoked — the job goes red for a reason that
+      # has nothing to do with the tests, and the trace does not say what to
+      # do about it. A red nobody can act on gets muted, which is strictly
+      # worse than the vacuous green it replaced.
+      #
+      # THE POLICY WAS ALREADY BUILT AND ALREADY TESTED — it just ran
+      # nowhere. `lib/util/devshell-preflight.nix` landed with its own
+      # `checks.<system>.devshell-preflight` suite (both failure arms
+      # verified red against deliberately-broken input), and its own header
+      # said out loud: "⚠ NOT WIRED AS OF THIS COMMIT. No workflow imports
+      # devshellPreflightPath — verified by grepping .github/ for it (zero
+      # hits)." A guard that passes its own unit tests while running against
+      # zero real subjects is the "unreached" subclass of tier ⊥ — the exact
+      # shape this repo spent 2026-07-27/28 removing elsewhere. This step is
+      # the subject set.
+      #
+      # IT CLASSIFIES, IT DOES NOT REPAIR. The three failure verdicts
+      # (Missing / Unevaluable / DevenvBacked) each print the actionable
+      # levers — re-lock substrate, or set `devshell-args: "--impure"` AND
+      # declare the `rust-overlay` input — because the repair is one command
+      # in the CONSUMER's repo and cannot be done from here.
+      #
+      # IT DOES NOT FALL BACK TO A BARE TOOLCHAIN, deliberately: this whole
+      # workflow exists to replace "a `dtolnay/rust-toolchain@stable` +
+      # bare `cargo test` job that passes only because ubuntu-latest's
+      # ambient environment happens to satisfy the requirement." Falling
+      # back on failure would restore that accident silently and go green on
+      # a subject that is not the thing being verified.
+      #
+      # `--impure` is not optional on the eval: on the very revs this gate
+      # exists to diagnose, the devShell attribute cannot be evaluated
+      # purely at all. Policy lives in a real Nix file rather than inline
+      # shell for the same reason `flake-checks-gate.nix` does — a gate
+      # three quoting layers deep that fails to PARSE never runs.
+      - name: Preflight -- can this job ENTER .#${{ inputs.devshell }}?
+        run: >-
+          nix eval --impure --raw --expr
+          'import (builtins.getFlake "github:pleme-io/substrate").devshellPreflightPath {
+             system    = builtins.currentSystem;
+             devshell  = "${{ inputs.devshell }}";
+             devShells = (builtins.getFlake (toString ./.)).devShells or {};
+           }'
+
+      - name: cargo fmt --check (inside .#${{ inputs.devshell }})
+        if: ${{ inputs.fmt-check }}
+        run: >-
+          nix develop ${{ inputs.devshell-args }} ".#${{ inputs.devshell }}"
+          -c cargo fmt --all -- --check
+
+      - name: cargo test (inside .#${{ inputs.devshell }})
+        env:
+          # Forces cargo to shell out to the real git binary (which honors
+          # the url.insteadOf rewrite above) instead of its bundled libgit2
+          # backend (which does not) -- same fix as release.yml's own
+          # CARGO_NET_GIT_FETCH_WITH_CLI wiring.
+          CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+        run: nix develop ${{ inputs.devshell-args }} ".#${{ inputs.devshell }}" -c cargo test ${{ inputs.test-args }}

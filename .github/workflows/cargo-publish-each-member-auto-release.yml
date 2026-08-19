@@ -1,0 +1,247 @@
+name: cargo-publish-each-member-auto-release
+
+# Reusable workflow for multi-crate workspaces WITHOUT a shared
+# [workspace.package].version. Each member has its own [package].version
+# and gets bumped/tagged/published independently.
+#
+# Consumer (.github/workflows/auto-release.yml):
+#
+#   on: { push: { branches: [main] } }
+#   jobs:
+#     release:
+#       uses: pleme-io/substrate/.github/workflows/cargo-publish-each-member-auto-release.yml@main
+#       secrets: inherit
+#
+# Patterns handled: rust-url, bindgen, dirs-next, ratatui, proptest,
+# insta, anything where cargo metadata returns >1 member but
+# [workspace.package].version is absent.
+#
+# Differences vs rust-auto-release.yml:
+#   - no workspace-level bump (each member bumps in-place)
+#   - tag convention: <member-name>-v<version> (per-member tags)
+#   - skip-when-no-source-changes uses per-member git diff against
+#     the latest <member>-v* tag
+#
+# secrets passed through:
+#   CRATES_API_TOKEN — same as rust-auto-release.yml; bridged to
+#                      CARGO_REGISTRY_TOKEN inside the action.
+#   BOT_PAT          — optional; cross-workflow tag triggers.
+
+on:
+  workflow_call:
+    inputs:
+      bump-type:
+        description: "patch | minor | major (per-member bump)"
+        type: string
+        required: false
+        default: patch
+      dry-run:
+        description: "cargo publish --dry-run only (no upload)"
+        type: string
+        required: false
+        default: "false"
+      no-verify:
+        description: "Skip cargo publish's verification compile."
+        type: string
+        required: false
+        default: "true"
+      skip-when-no-source-changes:
+        description: "Per-member: skip when no member-dir changes since the previous <member>-v* tag."
+        type: string
+        required: false
+        default: "true"
+      # THE RISK HERE IS DISCLOSURE, NOT MERELY CONSISTENCY — and it is the
+      # worst-case shape of it. `cargo publish` uploads a `.crate` tarball
+      # containing the crate's SOURCE to crates.io. It is not a tag that a
+      # proxy later fetches (the Go module-proxy shape, where a private repo
+      # simply cannot be fetched and so leaks nothing); the bytes leave the
+      # private boundary at publish time. crates.io then has no unpublish at
+      # all — `cargo yank` removes a version from RESOLUTION while leaving the
+      # tarball downloadable by exact version forever, so a yank withdraws
+      # nothing that was already read.
+      #
+      # This workflow amplifies that by design: it publishes EVERY workspace
+      # member, so one run of a private multi-crate workspace ships N crates'
+      # source rather than one.
+      #
+      # PRECONDITION, so nobody has to re-derive it: this workflow's ONE job
+      # bumps, publishes AND tags inside a single composite action
+      # (pleme-io/actions/cargo-publish-each-member — `commit-tag` fires only
+      # AFTER a successful publish, deliberately, so git can never tag a
+      # version that is not on the registry). Bump/tag and publish are
+      # therefore INSEPARABLE here, and withholding the publish necessarily
+      # withholds the bump and the tag with it. That is why the withheld
+      # notice below does not claim "the version was bumped and tagged" the
+      # way the two-job workflows' notices correctly do — here nothing moves.
+      publish-from-private:
+        description: >-
+          Publish even though the repository is private. Default false: a private
+          repo publishing to a public registry ships its source there, and a
+          registry publish cannot be withdrawn, only yanked. Set true only where
+          a private source deliberately produces a public artifact.
+        type: string
+        required: false
+        default: "false"
+    secrets:
+      CRATES_API_TOKEN:
+        # required:false, deliberately — this is the same defect
+        # cargo-auto-release.yml already documents. GitHub validates the WHOLE
+        # reusable call graph at STARTUP, before any job `if:` is evaluated, so
+        # `required: true` fails the caller with zero jobs and no step output.
+        # On GitHub Free an ORG secret reaches PUBLIC repos only, so every
+        # PRIVATE caller's `secrets: inherit` passes nothing here and trips it
+        # — measured 2026-08-08 on pleme-io/caixa-url:
+        #   Error when evaluating 'secrets'. Secret CRATES_API_TOKEN is required,
+        #   but not provided while calling.
+        # A startup failure names no repo and runs no step, which reads as
+        # "autorelease is broken". Absence is caught at USE time instead, where
+        # the error can name the secret and the repo missing it.
+        required: false
+        description: "crates.io publish token."
+      BOT_PAT:
+        required: false
+        description: "Optional PAT for cross-workflow tag triggers."
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Publish each workspace member
+    # A reusable workflow's `runs-on` executes in the CALLER's billing
+    # context, so a bare metered label here charges every PRIVATE consumer.
+    # That is what exhausted the org's Actions spending limit on 2026-08-08,
+    # after which every private repo's release path failed INSTANTLY with
+    # zero steps — which reads as "autobump/autorelease is broken" rather
+    # than "billing blocked". Public callers keep the exact label they had.
+    runs-on: ${{ github.event.repository.private && 'camelot-builder-pleme-eks' || 'ubuntu-latest' }}
+    # Two clauses, two different jobs.
+    #
+    # (1) Skip when the bot itself pushed (avoids tag-push -> publish ->
+    #     tag-push loops). Unchanged.
+    #
+    # (2) The private guard, WITH its opt-in escape, and its skip is ANNOUNCED
+    #     by `publish-withheld` below rather than left silent. A bare
+    #     `&& !private` here would be the exact defect this change exists to
+    #     remove: on 2026-08-08 graphql-synthesizer ran cargo-auto-release,
+    #     reported SUCCESS, bumped + tagged + pushed, and published nothing,
+    #     because a correct guard skipped its ship job and nothing said so. A
+    #     guard that fires must state that it fired.
+    #
+    # In a workflow_call the github context is the CALLER's run, so
+    # `github.event.repository.private` is the CONSUMER repo's visibility —
+    # the same expression family the `runs-on` above already routes on.
+    if: >-
+      github.actor != 'github-actions[bot]'
+      && (!github.event.repository.private || inputs.publish-from-private == 'true')
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.BOT_PAT || secrets.GITHUB_TOKEN }}
+
+      - uses: pleme-io/actions/cargo-publish-each-member@main
+        with:
+          bump-type: ${{ inputs.bump-type }}
+          dry-run: ${{ inputs.dry-run }}
+          no-verify: ${{ inputs.no-verify }}
+          skip-when-no-source-changes: ${{ inputs.skip-when-no-source-changes }}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_API_TOKEN }}
+          CRATES_API_TOKEN: ${{ secrets.CRATES_API_TOKEN }}
+
+      - name: Push per-member tags
+        if: success()
+        uses: pleme-io/actions/git-push-with-token@main
+        with:
+          token: ${{ secrets.BOT_PAT || secrets.GITHUB_TOKEN }}
+          branch: main
+          push-tags: "true"
+          # Same generated-lockfile race as `cargo-auto-release.yml` — see the
+          # longer note there. A workspace publishing each member is if
+          # anything more exposed: more crates, a longer job, a wider window
+          # for `gen-spec` to land its regeneration first.
+          regenerable-paths: "Cargo.lock Cargo.gen.lock Cargo.build-spec.json"
+
+  # ── The complement of `release`'s privacy guard: runs in exactly the runs
+  # where the guard withheld the publish, so the withholding is a STATEMENT
+  # rather than an absence. Same role cargo-auto-release.yml's "Registry
+  # catch-up (seals the skipped-ship green)" job plays for its own skipped
+  # ship — a skipped job is not a failed job, so without this the run
+  # concludes SUCCESS having done nothing, and green stops meaning anything.
+  publish-withheld:
+    name: 'publish withheld (private repo)'
+    # No `needs:` — `release` has none either (this workflow is one job doing
+    # bump+publish+tag), and the complement must mirror the job it complements
+    # or the two stop partitioning the same space.
+    #
+    # `always()` is therefore not doing the work it does in the two-job
+    # workflows, where it is what lifts the notice out of the
+    # skipped-because-my-dependency-skipped rule. It is kept because it costs
+    # nothing, because it makes the notice survive a cancellation, and because
+    # the day a `needs:` lands here it must already be present — that is
+    # exactly the edit that would otherwise silently re-bury the notice.
+    #
+    # The rest is the exact complement of release's condition: the same
+    # positive precondition (a human actor, not the bot's own tag push), then
+    # private AND no opt-in. `release` and this job partition the human-actor
+    # case — never both, never neither. The bot-actor loop guard deliberately
+    # selects NEITHER: a loop-guard skip is not a withholding, and announcing
+    # it as one would train the operator to ignore the notice.
+    if: >-
+      always()
+      && github.actor != 'github-actions[bot]'
+      && github.event.repository.private
+      && inputs.publish-from-private != 'true'
+    # Copied verbatim from `release`, and load-bearing rather than cosmetic:
+    # this job only ever selects when the caller IS private, and a private
+    # caller on `ubuntu-latest` is METERED against the caller's billing (a
+    # reusable workflow's runs-on bills the CALLER — the note on release's
+    # runs-on records the day that exhausted the org's spending limit). The
+    # ternary keeps even this two-step reporting job off metered hosted compute.
+    runs-on: ${{ github.event.repository.private && 'camelot-builder-pleme-eks' || 'ubuntu-latest' }}
+    permissions:
+      contents: read
+    steps:
+      # The wording is deliberately NOT the sibling workflows' "the version was
+      # bumped and tagged". Here it wasn't: bump, publish and tag are one
+      # indivisible composite action (see the publish-from-private input's
+      # note), so withholding the publish withholds all three. A notice that
+      # claimed a bump had happened would be the same class of untruth this
+      # whole change exists to remove, just louder.
+      #
+      # TWO SURFACES, TWO TYPED ACTIONS — the summary page and the run-level
+      # annotation. The annotation was a `run: echo "::notice …"` until
+      # annotation-publish existed; the comment that kept it inline ("GitHub
+      # exposes no action for annotations") named a MISSING PRIMITIVE, not an
+      # exception to ★★ PIPELINING. Both actions were implemented before this job
+      # was converted — step-summary-publish was a stub emitting a ::warning and
+      # exit 0 — because converting onto a stub would have deleted the notice
+      # silently, the exact defect this job exists to prevent. Byte-identity with
+      # the replaced echo is a row in annotation-publish/run.test.tlisp.
+      - uses: pleme-io/actions/step-summary-publish@main
+        with:
+          template: |
+            ### Publish withheld
+
+            Repository is private; nothing was published to {{registry}}.
+            No member was bumped or tagged either: this workflow bumps,
+            publishes and tags inside one composite action, so withholding
+            the publish withholds all three.
+
+            If this repo is meant to publish, set `publish-from-private: true`.
+          vars: '{"registry":"crates.io"}'
+      # Folded scalar (`>-`): the message contains ": ", which a plain scalar
+      # would parse as a mapping. Folding joins the lines with single spaces; a
+      # reflow that adds a double space or a blank line changes the rendered
+      # annotation.
+      - uses: pleme-io/actions/annotation-publish@main
+        with:
+          level: notice
+          title: Publish withheld
+          message: >-
+            This repository is private, so no workspace member was published to
+            crates.io. Nothing was bumped or tagged either -- this workflow
+            bumps, publishes and tags in one action, so the three move together.
+            Set publish-from-private: true if this repo is meant to publish
+            public crates from private source.

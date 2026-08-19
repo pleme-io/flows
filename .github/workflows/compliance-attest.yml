@@ -1,0 +1,107 @@
+name: compliance-attest
+
+# Composes the supply-chain attestation primitives:
+#   sbom-generate → cyclonedx-merge → syft-attest → cosign-verify →
+#   provenance-attest → slsa-attest
+#
+# For repos shipping SLSA-Level-3 attested artifacts.
+
+on:
+  workflow_call:
+    inputs:
+      artifact-path:    { type: string, required: true }
+      image-ref:        { type: string, required: false, default: "" }
+      # Default HIGH preserves every existing consumer's behavior.
+      # A hardened-image pipeline passes "UNKNOWN" for a genuine
+      # zero-tolerance gate (every severity, fixed or not).
+      fail-on-severity: { type: string, required: false, default: "HIGH" }
+      # Path (relative to the consumer's checkout) to a .trivyignore-format
+      # file of named, tracked exceptions. Empty = none.
+      ignore-file:      { type: string, required: false, default: "" }
+    secrets: {}
+
+permissions:
+  contents: read
+  id-token: write       # cosign keyless
+
+jobs:
+  sbom:
+    # A reusable workflow's `runs-on` executes in the CALLER's billing
+    # context, so a bare metered label here charges every PRIVATE consumer.
+    # That is what exhausted the org's Actions spending limit on 2026-08-08,
+    # after which every private repo's release path failed INSTANTLY with
+    # zero steps — which reads as "autobump/autorelease is broken" rather
+    # than "billing blocked". Public callers keep the exact label they had.
+    runs-on: ${{ github.event.repository.private && 'camelot-builder-pleme-eks' || 'ubuntu-latest' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pleme-io/actions/sbom-generate@main
+        with:
+          output-format: cyclonedx-json
+          output-file: sbom.cyclonedx.json
+      - uses: actions/upload-artifact@v4
+        with: { name: sbom, path: sbom.cyclonedx.json }
+
+  sign:
+    needs: sbom
+    # A reusable workflow's `runs-on` executes in the CALLER's billing
+    # context, so a bare metered label here charges every PRIVATE consumer.
+    # That is what exhausted the org's Actions spending limit on 2026-08-08,
+    # after which every private repo's release path failed INSTANTLY with
+    # zero steps — which reads as "autobump/autorelease is broken" rather
+    # than "billing blocked". Public callers keep the exact label they had.
+    runs-on: ${{ github.event.repository.private && 'camelot-builder-pleme-eks' || 'ubuntu-latest' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pleme-io/actions/provenance-attest@main
+        with:
+          artifact-path: ${{ inputs.artifact-path }}
+
+  slsa:
+    needs: sign
+    # A reusable workflow's `runs-on` executes in the CALLER's billing
+    # context, so a bare metered label here charges every PRIVATE consumer.
+    # That is what exhausted the org's Actions spending limit on 2026-08-08,
+    # after which every private repo's release path failed INSTANTLY with
+    # zero steps — which reads as "autobump/autorelease is broken" rather
+    # than "billing blocked". Public callers keep the exact label they had.
+    runs-on: ${{ github.event.repository.private && 'camelot-builder-pleme-eks' || 'ubuntu-latest' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pleme-io/actions/slsa-attest@main
+        with:
+          artifact-path: ${{ inputs.artifact-path }}
+
+  scan:
+    if: inputs.image-ref != ''
+    needs: sign
+    # A reusable workflow's `runs-on` executes in the CALLER's billing
+    # context, so a bare metered label here charges every PRIVATE consumer.
+    # That is what exhausted the org's Actions spending limit on 2026-08-08,
+    # after which every private repo's release path failed INSTANTLY with
+    # zero steps — which reads as "autobump/autorelease is broken" rather
+    # than "billing blocked". Public callers keep the exact label they had.
+    runs-on: ${{ github.event.repository.private && 'camelot-builder-pleme-eks' || 'ubuntu-latest' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pleme-io/actions/image-scan@main
+        with:
+          image-ref: ${{ inputs.image-ref }}
+          fail-on-severity: ${{ inputs.fail-on-severity }}
+          ignore-file: ${{ inputs.ignore-file }}
+
+  verify-and-attest:
+    needs: [slsa, scan]
+    if: always() && inputs.image-ref != ''
+    # A reusable workflow's `runs-on` executes in the CALLER's billing
+    # context, so a bare metered label here charges every PRIVATE consumer.
+    # That is what exhausted the org's Actions spending limit on 2026-08-08,
+    # after which every private repo's release path failed INSTANTLY with
+    # zero steps — which reads as "autobump/autorelease is broken" rather
+    # than "billing blocked". Public callers keep the exact label they had.
+    runs-on: ${{ github.event.repository.private && 'camelot-builder-pleme-eks' || 'ubuntu-latest' }}
+    steps:
+      - uses: pleme-io/actions/cosign-verify@main
+        with:
+          artifact: ${{ inputs.image-ref }}
+          certificate-identity: ${{ github.server_url }}/${{ github.repository }}/.github/workflows/compliance-attest.yml@${{ github.ref }}

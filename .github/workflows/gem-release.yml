@@ -1,0 +1,78 @@
+# Reusable workflow: tag-triggered RubyGems release.
+#
+# Usage (from a consumer repo, .github/workflows/release.yml):
+#
+#   on:
+#     push:
+#       tags: ['v*']
+#
+#   jobs:
+#     gem:
+#       uses: pleme-io/substrate/.github/workflows/gem-release.yml@main
+#       with:
+#         gem-name: pangea-aws    # matches <gem-name>.gemspec at repo root
+#       secrets:
+#         RUBYGEMS_API_KEY: ${{ secrets.RUBYGEMS_API_KEY }}
+#
+# Delegates the actual sanity-check + build + push to
+# pleme-io/actions/gem-publish (composite action backed by a tatara-
+# lisp script). This workflow only derives the version from the tag
+# and threads the API key through.
+
+name: gem-release
+
+on:
+  workflow_call:
+    inputs:
+      gem-name:
+        description: "Gem name (matches <gem-name>.gemspec at repo root)"
+        type: string
+        required: true
+      ruby-version:
+        description: "Ruby toolchain version"
+        type: string
+        default: "3.3"
+      runner:
+        description: "Runner label"
+        type: string
+        default: "ubuntu-24.04"
+    secrets:
+      RUBYGEMS_API_KEY:
+        # required:false, deliberately — this is the same defect
+        # cargo-auto-release.yml already documents. GitHub validates the WHOLE
+        # reusable call graph at STARTUP, before any job `if:` is evaluated, so
+        # `required: true` fails the caller with zero jobs and no step output.
+        # On GitHub Free an ORG secret reaches PUBLIC repos only, so every
+        # PRIVATE caller's `secrets: inherit` passes nothing here and trips it
+        # — measured 2026-08-08 on pleme-io/caixa-url:
+        #   Error when evaluating 'secrets'. Secret RUBYGEMS_API_KEY is required,
+        #   but not provided while calling.
+        # A startup failure names no repo and runs no step, which reads as
+        # "autorelease is broken". Absence is caught at USE time instead, where
+        # the error can name the secret and the repo missing it.
+        description: "RubyGems API key with push permission for this gem"
+        required: false
+
+jobs:
+  derive-version:
+    name: Derive gem version from tag
+    runs-on: ${{ inputs.runner }}
+    outputs:
+      version: ${{ steps.derive.outputs.version }}
+    steps:
+      - id: derive
+        uses: pleme-io/actions/derive-version-from-tag@main
+
+  publish:
+    name: Build & push to rubygems.org
+    needs: derive-version
+    runs-on: ${{ inputs.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pleme-io/actions/gem-publish@main
+        with:
+          gem-name: ${{ inputs.gem-name }}
+          tag-version: ${{ needs.derive-version.outputs.version }}
+          ruby-version: ${{ inputs.ruby-version }}
+        env:
+          GEM_HOST_API_KEY: ${{ secrets.RUBYGEMS_API_KEY }}

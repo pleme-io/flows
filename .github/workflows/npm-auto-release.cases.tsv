@@ -1,0 +1,64 @@
+# Case table for substrate/.github/workflows/npm-auto-release.yml
+#
+# TAB-separated: <name> <context k=v;k=v> <expect-run csv> <expect-skip csv>
+#
+# WHAT THIS PINS. npm-auto-release has three jobs: bump -> {ship |
+# publish-withheld}. Four context paths appear in an `if:` — github.actor (the
+# bot re-trigger loop guard on bump), needs.bump.outputs.bumped (the publish
+# gate), github.event.repository.private and inputs.publish-from-private (the
+# privacy guard and its opt-in escape). The table fixes the selected set for
+# every combination that can actually occur.
+#
+# THE THREE PRIVACY ROWS ARE THE POINT OF THIS FILE, AND ROW 2 REVERSED ON
+# 2026-08-17. It used to assert that a PRIVATE repo published anyway, because
+# this workflow carried no guard at all and github.event.repository.private
+# appeared only inside the two runs-on runner-routing expressions, which select
+# a runner and gate nothing. That divergence from cargo-auto-release was
+# deliberate-by-accident, and it was a disclosure hole: `npm publish` uploads a
+# TARBALL of the package contents to registry.npmjs.org, so a private repo's
+# `src` became world-readable, and an npm publish cannot be withdrawn after 72h
+# — only deprecated, which withdraws nothing.
+#
+# So ship now carries the guard. What makes adding it safe rather than a
+# re-run of the very defect the sweep exists to remove is that the guard
+# ANNOUNCES ITSELF: publish-withheld is ship's exact complement over the
+# bumped case, so exactly one of the two selects whenever a bump happened, and
+# a withheld publish emits a ::notice + a step summary instead of an absence.
+# Rows 2 and 3 assert both halves of that partition — 2 that a private repo
+# withholds AND says so, 3 that the opt-in restores publishing and stands the
+# notice down. If either half ever stops holding, the table names it.
+#
+# inputs.publish-from-private is declared in EVERY row, including the public
+# ones where no `if:` outcome turns on it: an undeclared context path is an
+# ERROR by design, because a case that models a scenario while leaving a path
+# it does not mention to default silently is how a table drifts out from under
+# its workflow. always() and github.event_name are declared for the same
+# reason.
+#
+# needs-propagation is asserted by row 5: bump is skipped by the bot guard, so
+# ship is skipped too even though nothing about ship's own condition changed.
+# Its bumped value is EMPTY, not 'false', because that is what a skipped
+# upstream job yields — a distinct state the table is able to say.
+# publish-withheld skips there on its own condition rather than by propagation
+# (its always() lifts it out of the propagation rule on purpose), which is the
+# behaviour that keeps the bot loop from emitting a spurious withheld notice.
+
+public-bump	github.actor=human;github.event_name=push;github.event.repository.private=false;inputs.publish-from-private=false;needs.bump.outputs.bumped=true;always()=true	bump,ship	publish-withheld
+
+# THE GUARD FIRING, AND SAYING SO. A private repo publishes nothing — and
+# publish-withheld runs, so the skip is a statement rather than an absence.
+private-bump-withheld	github.actor=human;github.event_name=push;github.event.repository.private=true;inputs.publish-from-private=false;needs.bump.outputs.bumped=true;always()=true	bump,publish-withheld	ship
+
+# THE ESCAPE HATCH. A private source deliberately producing a public artifact
+# opts in; ship runs and the withheld notice stands down.
+private-bump-opt-in	github.actor=human;github.event_name=push;github.event.repository.private=true;inputs.publish-from-private=true;needs.bump.outputs.bumped=true;always()=true	bump,ship	publish-withheld
+
+# No version change: bump runs and reports bumped=false; ship is correctly
+# gated off, and publish-withheld stays quiet because nothing was withheld —
+# there was nothing to publish.
+public-no-bump	github.actor=human;github.event_name=push;github.event.repository.private=false;inputs.publish-from-private=false;needs.bump.outputs.bumped=false;always()=true	bump	ship,publish-withheld
+
+# Loop guard: the push that bump itself made must not re-enter. bump skips,
+# ship skips by needs-propagation (it declares no always()), and
+# publish-withheld skips on bumped != 'true' despite its always().
+bot-push-loop-guard	github.actor=github-actions[bot];github.event_name=push;github.event.repository.private=false;inputs.publish-from-private=false;needs.bump.outputs.bumped=;always()=true		bump,ship,publish-withheld

@@ -1,0 +1,404 @@
+name: cargo-auto-release
+
+# Reusable workflow: on push to main, bump a single-crate Rust
+# repo's package.version, commit, tag, push, publish to crates.io.
+#
+# Use this for non-workspace Rust repos (single library or single
+# binary). For workspace repos use rust-auto-release.yml instead.
+#
+# Three jobs do the work. `bump` writes + tags + pushes the version.
+# `ship` publishes when a bump happened. `drip` runs in ship's
+# complement and re-asserts that main's version is on the registry —
+# it is what stops the bot's own release push (which starts a second
+# run whose bump has nothing to do, so ship is SKIPPED) from
+# concluding green while the registry received nothing. Read drip's
+# header before changing either condition; the two are complementary
+# on purpose.
+#
+# Consumer (.github/workflows/auto-release.yml):
+#
+#   on: { push: { branches: [main] } }
+#   jobs:
+#     release:
+#       uses: pleme-io/substrate/.github/workflows/cargo-auto-release.yml@main
+#       secrets: inherit
+
+on:
+  workflow_call:
+    inputs:
+      bump-type:
+        type: string
+        required: false
+        default: patch
+      crate-path:
+        description: >-
+          Directory containing the crate's Cargo.toml, relative to the repo
+          root. Defaults to "." so existing callers are unaffected. Set it
+          for a repo whose crate is not at the root (e.g. forge -> "cli"),
+          which previously could not use this workflow at all: cargo-bump
+          aborted with "no Cargo.toml at repo root".
+        required: false
+        type: string
+        default: "."
+      source-paths:
+        description: >-
+          Paths whose changes justify a release. Leave EMPTY (the default) to
+          derive them from crate-path — that is what makes crate-path alone
+          sufficient. Set explicitly only to override the derivation.
+        type: string
+        required: false
+        default: ""
+      add-paths:
+        description: >-
+          Paths git-add'ed into the release commit. Leave EMPTY (the default)
+          to derive from crate-path. A root-relative default here is what
+          broke forge's first crate-path release: the bump correctly wrote
+          cli/Cargo.toml, then the commit step staged a non-existent
+          ./Cargo.toml, staged nothing, and `git commit` exited 1.
+        type: string
+        required: false
+        default: ""
+      no-verify:
+        type: string
+        required: false
+        default: "true"
+      regenerate-cargo-nix:
+        description: "Regenerate Cargo.nix via crate2nix after bump. Set false for path-dep crates."
+        type: string
+        required: false
+        default: "true"
+      # Runner routing: forwarded as runner-resolve's `override` in the
+      # resolve-runner job below. Empty (default) routes by CALLER repo
+      # visibility — private repos → camelot-builder-pleme-eks, public
+      # repos → ubuntu-latest — via runner-resolve's own
+      # visibility-default tier, the canonical home for this precedence
+      # (also honors an optional repo-committed .github/runner.yml, which
+      # a bare ternary here never could).
+      runner:
+        description: "Explicit runner label override; empty = route by caller repo visibility (private → camelot-builder-pleme-eks, public → ubuntu-latest) via runner-resolve."
+        type: string
+        required: false
+        default: ""
+    secrets:
+      # required:false, deliberately. GitHub validates the WHOLE reusable call
+      # graph at startup, BEFORE any job `if:` is evaluated, so a
+      # `required: true` here makes every caller of the polymorphic
+      # auto-release.yml fail with startup_failure and zero jobs — including
+      # repos that would never reach this arm. That is the
+      # union-of-required-secrets unsatisfiability this file's sibling comment
+      # already names; ruby-gem was dropped as an arm for it while four arms
+      # kept the same declaration. Absence is caught at publish time instead,
+      # where the error can name the secret and the repo it is missing from.
+      CRATES_API_TOKEN:
+        required: false
+      BOT_PAT:
+        required: false
+
+permissions:
+  contents: write
+
+# Serialize releases per repository — two pushes to main otherwise race two
+# bump runs from the same base and the second push is rejected non-ff (its
+# bump lost). Queue rather than cancel; an in-flight release must finish.
+# Only the entry workflow's concurrency is honored by GitHub.
+#
+# The same group is what makes the `drip` job below trustworthy: the bot's
+# own `release: vX` push queues BEHIND the push run that created it, so drip
+# reads the registry only after that run's ship has finished (or failed).
+# Without the queue, drip could race a still-uploading ship and report a
+# false red.
+concurrency:
+  group: auto-release-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  # CONSOLIDATED 2026-07-24: was a hand-rolled visibility ternary
+  # duplicated in both `bump` and `ship` below (this file's own prior
+  # comment explained why it lived inline rather than a needs-job —
+  # workflow_call input defaults are static, so the fallback can't live
+  # in `inputs.runner`'s own default). That reasoning still holds for
+  # WHY a job is needed, but the actual override>file>default>
+  # visibility-default precedence now has one canonical home
+  # (pleme-io/actions/runner-resolve, extended the same day this
+  # comment was written after the identical logic was found duplicated
+  # a third time — this file, image-push.yml, and pangea-operator's own
+  # hand-rolled resolve-runner job all re-derived it independently).
+  # Same job-based pattern image-push.yml now uses; this job's own
+  # runs-on is the one place a visibility-only ternary is still correct
+  # (bootstrapping the resolver can't call the resolver).
+  resolve-runner:
+    name: resolve build runner
+    runs-on: ${{ github.event.repository.private && 'camelot-builder-pleme-eks' || 'ubuntu-latest' }}
+    outputs:
+      runner: ${{ steps.resolve.outputs.runner }}
+    steps:
+      - id: resolve
+        uses: pleme-io/actions/runner-resolve@main
+        with:
+          override: ${{ inputs.runner }}
+          public-runner-default: "ubuntu-latest"
+
+  # The routing precondition, asserted rather than documented.
+  #
+  # This file's header has said "For workspace repos use
+  # rust-auto-release.yml instead" since it was written, and a header cannot
+  # fail a build. A fleet CI sweep (2026-08-14, 903 active repos, 534 red
+  # workflows) found seven repos whose shim named THIS workflow over a
+  # [workspace] root. Every release run died at
+  #
+  #     ERROR cargo-publish-crate: package.name not found in Cargo.toml
+  #
+  # — a true statement about the manifest (a workspace root has no [package]
+  # by definition) that says nothing about the actual mistake, which was one
+  # line in a shim two repos away.
+  #
+  # The check is one call with a value; the comparison, the message and the
+  # exit live in pleme-io/actions/detect-repo-type behind its `expect` input,
+  # so any workflow with a shape precondition states it the same way.
+  precondition:
+    name: repo shape
+    needs: resolve-runner
+    runs-on: ${{ needs.resolve-runner.outputs.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pleme-io/actions/detect-repo-type@main
+        with:
+          expect: rust-single-crate
+
+  bump:
+    needs: [resolve-runner, precondition]
+    runs-on: ${{ needs.resolve-runner.outputs.runner }}
+    # Skip when the bot itself pushed (avoids tag-push → bump → tag-push
+    # loops) and on a scheduled tick: a schedule is a capacity-ride for the
+    # `drip` job below and must never bump or tag. The schedule clause is
+    # parity with rust-auto-release.yml's bump, which has carried it since
+    # its own drip landed; this file grew a drip without it and a consumer
+    # adding `on: schedule` would have gotten a cron-driven version bump.
+    if: github.actor != 'github-actions[bot]' && github.event_name != 'schedule'
+    outputs:
+      bumped: ${{ steps.bump.outputs.bumped }}
+      new-version: ${{ steps.bump.outputs.new-version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.BOT_PAT || secrets.GITHUB_TOKEN }}
+
+      # Private git dependencies. checkout's token is scoped to THIS repo, so
+      # a build that reads a sibling PRIVATE pleme-io repo (≈20 of them
+      # flipped private 2026-07-23; 84 consumers depend on one) fails with
+      # "failed to authenticate when downloading repository" — mado tripped
+      # exactly this. The action owns the BOT_PAT > GITHUB_TOKEN order AND
+      # the checkout-extraheader unset that makes the rewrite take effect.
+      - uses: pleme-io/actions/git-credentials@main
+        with:
+          bot-pat: ${{ secrets.BOT_PAT }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: bump
+        uses: pleme-io/actions/cargo-bump@main
+        with:
+          bump-type: ${{ inputs.bump-type }}
+          crate-path: ${{ inputs.crate-path }}
+          source-paths: ${{ inputs.source-paths != '' && inputs.source-paths || (inputs.crate-path == '.' && 'src Cargo.toml Cargo.lock' || format('{0}/src {0}/Cargo.toml {0}/Cargo.lock', inputs.crate-path)) }}
+          regenerate-cargo-nix: ${{ inputs.regenerate-cargo-nix }}
+        env:
+          # cargo's bundled libgit2 ignores url.insteadOf; this forces the
+          # real git binary, which honours it. Required for crate2nix regen
+          # and `cargo update` to resolve private deps.
+          CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+
+      - if: steps.bump.outputs.bumped == 'true'
+        uses: pleme-io/actions/git-commit-tag@main
+        with:
+          version: ${{ steps.bump.outputs.new-version }}
+          # Cargo.build-spec.json is staged for the same reason Cargo.gen.lock
+          # is: both are co-outputs of the ONE `gen build .` that
+          # ensure-gen-lock-fresh already runs during the bump (stdlib.tlisp
+          # regen-gen-lock), after the version write and before this step.
+          # Only the lock was ever staged, so the regenerated spec died with
+          # the runner and every repo that COMMITS its spec (17 fleet-wide,
+          # deliberately un-gitignored for no-IFD deterministic builds) went
+          # stale on release. Confirmed on vigy 264cad1, namimado 953241d and
+          # izumi b0fe9f8: each staged Cargo.gen.lock and not the spec.
+          # Safe for the ~406 repos that DO gitignore it — git-commit-tag
+          # stages per-path under exec-check, which returns the status rather
+          # than raising, so an ignored (exit 1) or absent (exit 128) pathspec
+          # fails alone. Verified empirically, not inferred.
+          add-paths: ${{ inputs.add-paths != '' && inputs.add-paths || (inputs.crate-path == '.' && 'Cargo.toml Cargo.lock Cargo.nix Cargo.gen.lock Cargo.build-spec.json' || format('{0}/Cargo.toml {0}/Cargo.lock {0}/Cargo.nix {0}/Cargo.gen.lock {0}/Cargo.build-spec.json', inputs.crate-path)) }}
+
+      - if: steps.bump.outputs.bumped == 'true'
+        uses: pleme-io/actions/git-push-with-token@main
+        with:
+          token: ${{ secrets.BOT_PAT || secrets.GITHUB_TOKEN }}
+          branch: main
+          push-tags: "true"
+          # The three lockfiles a bump touches are all GENERATED. `gen-spec`
+          # fires on the same push as this workflow and finishes first, so its
+          # regenerated `Cargo.gen.lock` lands while this job is still
+          # building — every release then rebases into a conflict on a file no
+          # human wrote, and aborts. That stranded egaku-term at crates.io
+          # 0.3.1 with its repo at 0.3.4: three bumps tagged and never shipped.
+          # Declaring them regenerable lets the rebase resolve in favour of the
+          # bump; gen-spec re-runs on the resulting push and reconciles.
+          # A conflict in any AUTHORED file still aborts, and names the path.
+          regenerable-paths: "Cargo.lock Cargo.gen.lock Cargo.build-spec.json"
+
+  ship:
+    needs: [resolve-runner, bump]
+    runs-on: ${{ needs.resolve-runner.outputs.runner }}
+    # privacy posture 2026-07-05: private repos bump+tag only — no public
+    # registry publish; see pangea-architectures PRIVACY-WAVES.md. Publishing
+    # a new version from a private repo leaks code to crates.io and undoes
+    # yanks. Same caller-visibility expression family as the runner routing
+    # above (in a workflow_call the github context is the CALLER's run).
+    # Nothing depends on this job, so a visibility-skip fails nothing downstream.
+    if: needs.bump.outputs.bumped == 'true' && !github.event.repository.private
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+          token: ${{ secrets.BOT_PAT || secrets.GITHUB_TOKEN }}
+
+      # Same reason as the bump job: `cargo publish` verifies the package by
+      # BUILDING it, which resolves every git dependency.
+      - uses: pleme-io/actions/git-credentials@main
+        with:
+          bot-pat: ${{ secrets.BOT_PAT }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: pleme-io/actions/cargo-publish-crate@main
+        with:
+          no-verify: ${{ inputs.no-verify }}
+          crate-path: ${{ inputs.crate-path }}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_API_TOKEN }}
+          CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+
+  # ── Drip: the registry-truth job. Runs in exactly the complement of
+  # `ship` — every run in which ship did NOT run — and re-asserts the one
+  # invariant a release is supposed to establish: main's package.version
+  # is on crates.io.
+  #
+  # WHY THIS EXISTS (the defect it closes). A release here is two runs, not
+  # one. Run 1 is the human push: bump writes the version, commits
+  # `release: vX`, pushes it, and ship publishes. That push is itself a push
+  # to main, so it starts run 2 — whose bump correctly finds nothing to do
+  # and reports bumped=false, which SKIPS ship. A skipped job is not a
+  # failed job, so run 2 concludes SUCCESS having published nothing. The
+  # newest row in `gh run list` is therefore green whether or not run 1's
+  # ship worked, and the actual error is buried one row down in a run
+  # nobody re-reads.
+  #
+  # Confirmed live, not inferred: garasu run 29610025821
+  # (`release: workspace v0.1.5`, a bot push) — bump success, ship SKIPPED,
+  # run conclusion SUCCESS. forge run 30553867434 is the same shape.
+  #
+  # Measured 2026-07-30 by diffing every public consumer's main
+  # package.version against crates.io (denominator: 95 public repos calling
+  # this workflow, out of 398 consumer workflow files fleet-wide): 44
+  # in-sync, 28 behind, 21 never published at all, 2 with no root manifest.
+  # So 49 of 95 public consumers were reporting green while the registry
+  # held nothing current. The worst: shikumi 0.1.345 on the registry vs
+  # 0.1.437 on main (92 versions), mado 0.0.15 vs 0.1.99. These are counts
+  # on that date, not a standing property — re-measure, do not cite.
+  #
+  # WHY A DRIP JOB RATHER THAN A NO-OP NOTICE. Making run 2 print "nothing
+  # to bump" would document the emptiness without contradicting it — the
+  # row stays green and an operator still has to go looking. What actually
+  # has to change is what green MEANS. With this job, a green run asserts
+  # the registry holds main's version; a repo whose ship failed goes red on
+  # the NEXT run and stays red, which is how the 26 become visible without
+  # anyone auditing anything. It is also the recovery path this file lacked
+  # (its rust-auto-release.yml sibling has had one since the drip landed
+  # there): cargo-publish-crate is idempotent — already-published is an
+  # explicit green — so this job publishes what a failed ship missed rather
+  # than merely complaining about it.
+  #
+  # BLAST RADIUS IS BOUNDED BY CONSTRUCTION. Drip runs the SAME action ship
+  # runs, against the same manifest, with the same token. It therefore
+  # cannot produce a red that a real release would not also have produced —
+  # every new red is a repo whose ship was already failing and being
+  # masked. It never bumps, never tags, never writes to the repo
+  # (permissions: contents: read), and never runs for a private repo.
+  #
+  # It also gives `workflow_dispatch` a meaning it did not have: today a
+  # dispatch with no source change bumps nothing, skips ship and reports
+  # success. With drip it becomes the operator's "publish what's missing
+  # now" handle, needing no consumer-side change and no fake commit.
+  drip:
+    name: Registry catch-up (seals the skipped-ship green)
+    needs: [resolve-runner, bump]
+    runs-on: ${{ needs.resolve-runner.outputs.runner }}
+    permissions:
+      contents: read
+    # `always()` is load-bearing, not decoration: `bump` is SKIPPED outright
+    # on a schedule tick and whenever the bot is the actor, and a job that
+    # needs a skipped job is itself skipped by default — which is precisely
+    # the silent-skip failure this whole job exists to end.
+    #
+    # `needs.bump.outputs.bumped != 'true'` is the complement of ship's
+    # condition: '' (bump skipped or failed) and 'false' (nothing to bump)
+    # both select drip; 'true' hands the run to ship and drip stands down so
+    # the two never double-publish.
+    #
+    # resolve-runner is guarded because runs-on reads its output — an
+    # unguarded always() there would fail on an empty runs-on and blame drip
+    # for a resolver outage. A resolver failure already reds the run, so
+    # nothing is masked by standing down.
+    #
+    # Private repos never publish (privacy posture 2026-07-05, see
+    # pangea-architectures PRIVACY-WAVES.md), so for them there is no
+    # registry claim to make and green is already honest.
+    #
+    # crate-path: threaded into cargo-publish-crate below, so a non-root
+    # crate now publishes and verifies from the directory the caller named.
+    # Drip previously stood down on `inputs.crate-path != '.'` because the
+    # publish action read ./Cargo.toml unconditionally — a repo with a root
+    # manifest plus `crate-path: cli` would have published the WRONG package.
+    # That gap was in the action, and it is closed (pleme-io/actions
+    # cargo-publish-crate gained a crate-path input, same shape cargo-bump
+    # already used); the stand-down clause went with it.
+    #
+    # Measured 2026-07-30 across all 398 consumer workflow files: exactly ONE
+    # sets crate-path — forge (`crate-path: "cli"`), whose crate lives at
+    # cli/ and which therefore had no publishable root manifest at all, so
+    # its ship was equally non-functional (forge run 30553867434: bump
+    # success, ship skipped). Forge is the single consumer this unblocks, and
+    # the first real proof will be its next run — until one lands, "forge can
+    # publish" is a claim this file makes, not one it has demonstrated.
+    if: >-
+      always()
+      && needs.resolve-runner.result == 'success'
+      && needs.bump.outputs.bumped != 'true'
+      && !github.event.repository.private
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+          token: ${{ secrets.BOT_PAT || secrets.GITHUB_TOKEN }}
+
+      # Same reason as bump and ship: cargo resolves every git dependency
+      # while packaging, and ~20 sibling pleme-io repos went private
+      # 2026-07-23.
+      - uses: pleme-io/actions/git-credentials@main
+        with:
+          bot-pat: ${{ secrets.BOT_PAT }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # Idempotent by contract: already-on-registry is an explicit green
+      # ("skipping '<name>@<version>' — already on registry"), which is the
+      # no-op run stating its verdict out loud instead of inheriting one.
+      # A name owned by someone else (crates.io 403) and a structurally
+      # unpublishable manifest (git dep / versionless path dep) both exit 1
+      # with the remedy named — that is the red the 26 behind repos have
+      # been owed.
+      - uses: pleme-io/actions/cargo-publish-crate@main
+        with:
+          no-verify: ${{ inputs.no-verify }}
+          crate-path: ${{ inputs.crate-path }}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_API_TOKEN }}
+          CARGO_NET_GIT_FETCH_WITH_CLI: "true"

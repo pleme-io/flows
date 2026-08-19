@@ -1,0 +1,53 @@
+# Reusable workflow: publish a Rust crate to crates.io from a tag.
+#
+# Usage (from a consumer repo):
+#
+#   jobs:
+#     publish:
+#       uses: pleme-io/substrate/.github/workflows/crates-publish.yml@main
+#       secrets:
+#         CRATES_API_TOKEN: ${{ secrets.CRATES_API_TOKEN }}
+#
+# The two non-obvious decisions here — why the secret is `required: false`
+# and why `runs-on` is an expression — are documented at each site below,
+# and both were paid for on 2026-08-08 rather than reasoned about.
+name: Publish to crates.io
+
+on:
+  workflow_call:
+    secrets:
+      CRATES_API_TOKEN:
+        # required:false, deliberately — this is the same defect
+        # cargo-auto-release.yml already documents. GitHub validates the WHOLE
+        # reusable call graph at STARTUP, before any job `if:` is evaluated, so
+        # `required: true` fails the caller with zero jobs and no step output.
+        # On GitHub Free an ORG secret reaches PUBLIC repos only, so every
+        # PRIVATE caller's `secrets: inherit` passes nothing here and trips it
+        # — measured 2026-08-08 on pleme-io/caixa-url:
+        #   Error when evaluating 'secrets'. Secret CRATES_API_TOKEN is required,
+        #   but not provided while calling.
+        # A startup failure names no repo and runs no step, which reads as
+        # "autorelease is broken". Absence is caught at USE time instead, where
+        # the error can name the secret and the repo missing it.
+        required: false
+
+jobs:
+  publish:
+    name: Publish to crates.io
+    # A reusable workflow's `runs-on` executes in the CALLER's billing
+    # context, so a bare metered label here charges every PRIVATE consumer.
+    # That is what exhausted the org's Actions spending limit on 2026-08-08,
+    # after which every private repo's release path failed INSTANTLY with
+    # zero steps — which reads as "autobump/autorelease is broken" rather
+    # than "billing blocked". Public callers keep the exact label they had.
+    runs-on: ${{ github.event.repository.private && 'camelot-builder-pleme-eks' || 'ubuntu-latest' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_API_TOKEN }}
+        run: cargo publish --allow-dirty

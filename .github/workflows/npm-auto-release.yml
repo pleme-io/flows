@@ -1,0 +1,207 @@
+name: npm-auto-release
+
+# Reusable workflow: on push to main, bump an npm package's
+# version, commit, tag, push, publish to npmjs.org.
+#
+# Consumer (.github/workflows/auto-release.yml):
+#   on: { push: { branches: [main] } }
+#   jobs:
+#     release:
+#       uses: pleme-io/substrate/.github/workflows/npm-auto-release.yml@main
+#       secrets: inherit
+
+on:
+  workflow_call:
+    inputs:
+      bump-type:
+        type: string
+        required: false
+        default: patch
+      access:
+        type: string
+        required: false
+        default: public
+      source-paths:
+        type: string
+        required: false
+        default: "src package.json package-lock.json"
+      add-paths:
+        type: string
+        required: false
+        default: "package.json package-lock.json"
+      # Runner routing: empty default routes by CALLER repo visibility —
+      # private repos → the org-scoped camelot-builder-pleme-eks ARC pool (avoids billed
+      # hosted minutes; org runner groups refuse public repos anyway), public
+      # repos → ubuntu-latest. Schedule-triggered callers may lack
+      # github.event.repository and fall open to hosted (documented edge).
+      # Do NOT put an expression in this default — workflow_call input
+      # defaults are static; the fallback lives in each job's runs-on.
+      runner:
+        description: "Explicit runner label override; empty = route by caller repo visibility (private → camelot-builder-pleme-eks, public → ubuntu-latest)."
+        type: string
+        required: false
+        default: ""
+      # THE RISK HERE IS DISCLOSURE, NOT MERELY CONSISTENCY. `npm publish`
+      # uploads a TARBALL OF THE PACKAGE CONTENTS to registry.npmjs.org — it is
+      # not a tag that a proxy later fetches (the Go module-proxy shape, where a
+      # private repo simply cannot be fetched and so leaks nothing). Everything
+      # the package's `files`/`.npmignore` set admits — `src` by this
+      # workflow's own default source-paths — becomes world-readable the moment
+      # it lands, and `npm unpublish` is only permitted within 72h on a package
+      # nothing depends on; after that the only remedy is `npm deprecate`, which
+      # withdraws nothing. `access: restricted` narrows INSTALL rights, not the
+      # fact that the bytes left the private boundary. So the guard below is a
+      # real containment boundary, not a tidiness rule.
+      publish-from-private:
+        description: >-
+          Publish even though the repository is private. Default false: a private
+          repo publishing to a public registry ships its source there, and a
+          registry publish cannot be withdrawn, only yanked. Set true only where
+          a private source deliberately produces a public artifact.
+        type: string
+        required: false
+        default: "false"
+    secrets:
+      # required:false, deliberately. GitHub validates the WHOLE reusable call
+      # graph at startup, BEFORE any job `if:` is evaluated, so a
+      # `required: true` here makes every caller of the polymorphic
+      # auto-release.yml fail with startup_failure and zero jobs — including
+      # repos that would never reach this arm. That is the
+      # union-of-required-secrets unsatisfiability this file's sibling comment
+      # already names; ruby-gem was dropped as an arm for it while four arms
+      # kept the same declaration. Absence is caught at publish time instead,
+      # where the error can name the secret and the repo it is missing from.
+      NPM_TOKEN:
+        required: false
+      BOT_PAT:
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  bump:
+    runs-on: ${{ inputs.runner != '' && inputs.runner || (github.event.repository.private && 'camelot-builder-pleme-eks' || 'ubuntu-latest') }}
+    if: github.actor != 'github-actions[bot]'
+    outputs:
+      bumped: ${{ steps.bump.outputs.bumped }}
+      new-version: ${{ steps.bump.outputs.new-version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.BOT_PAT || secrets.GITHUB_TOKEN }}
+
+      - id: bump
+        uses: pleme-io/actions/npm-bump@main
+        with:
+          bump-type: ${{ inputs.bump-type }}
+          source-paths: ${{ inputs.source-paths }}
+
+      - if: steps.bump.outputs.bumped == 'true'
+        uses: pleme-io/actions/git-commit-tag@main
+        with:
+          version: ${{ steps.bump.outputs.new-version }}
+          add-paths: ${{ inputs.add-paths }}
+
+      - if: steps.bump.outputs.bumped == 'true'
+        uses: pleme-io/actions/git-push-with-token@main
+        with:
+          token: ${{ secrets.BOT_PAT || secrets.GITHUB_TOKEN }}
+          branch: main
+          push-tags: "true"
+
+  ship:
+    needs: bump
+    runs-on: ${{ inputs.runner != '' && inputs.runner || (github.event.repository.private && 'camelot-builder-pleme-eks' || 'ubuntu-latest') }}
+    # The private guard carries its own escape hatch, and its skip is ANNOUNCED
+    # by `publish-withheld` below. A bare `&& !private` here would be the exact
+    # defect this change exists to remove: on 2026-08-08 graphql-synthesizer ran
+    # cargo-auto-release, reported SUCCESS, bumped + tagged + pushed, and
+    # published nothing, because a correct guard skipped its ship job and
+    # nothing said so. A guard that fires must state that it fired.
+    if: >-
+      needs.bump.outputs.bumped == 'true'
+      && (!github.event.repository.private || inputs.publish-from-private == 'true')
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+          token: ${{ secrets.BOT_PAT || secrets.GITHUB_TOKEN }}
+
+      - uses: pleme-io/actions/npm-publish@main
+        with:
+          access: ${{ inputs.access }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  publish-withheld:
+    name: 'publish withheld (private repo)'
+    needs: bump
+    # `always()` defeats the rule that a job needing a SKIPPED-or-FAILED job is
+    # itself skipped — which is exactly how a withheld-publish notice would fall
+    # back into the silence this job exists to break.
+    #
+    # BE PRECISE ABOUT WHAT IT BUYS HERE, measured 2026-08-17 by deleting it and
+    # re-running the case table: all five rows stayed green. It is not what
+    # selects this job in any modelled case, because the `bumped == 'true'`
+    # precondition already implies bump ran to completion, so needs-propagation
+    # is satisfied anyway. What it still covers is the one shape the table does
+    # not model: bump sets the output and then FAILS a later step (the tag push),
+    # leaving bumped == 'true' with bump.result == 'failure'. Without always()
+    # that run withholds the publish and says nothing — the exact defect — so
+    # always() stays, as insurance rather than as the mechanism.
+    #
+    # The rest is the exact complement of ship's condition: same positive
+    # precondition (bumped == 'true'), then private AND no opt-in. ship and this
+    # job therefore partition the bumped case — never both, never neither.
+    if: >-
+      always()
+      && needs.bump.outputs.bumped == 'true'
+      && github.event.repository.private
+      && inputs.publish-from-private != 'true'
+    runs-on: ${{ inputs.runner != '' && inputs.runner || (github.event.repository.private && 'camelot-builder-pleme-eks' || 'ubuntu-latest') }}
+    permissions:
+      contents: read
+    steps:
+      # TWO SURFACES, TWO TYPED ACTIONS. step-summary-publish writes markdown to
+      # $GITHUB_STEP_SUMMARY; annotation-publish writes the workflow command that
+      # becomes a banner on the run and the PR checks tab. Both, because a reader
+      # who never opens the summary page still has to learn the publish was
+      # withheld.
+      #
+      # This job used to end in a `run: echo "::notice …"`, with a comment saying
+      # the summary action could not carry it — true, and it described a MISSING
+      # PRIMITIVE rather than an exception to ★★ PIPELINING. Both actions were
+      # implemented before this job was converted (step-summary-publish was a
+      # stub emitting a ::warning and exit 0; annotation-publish did not exist),
+      # because converting first would have deleted the notice silently, which is
+      # the exact defect this job exists to prevent. The annotation is proven
+      # byte-identical to the echo it replaced by a row in
+      # annotation-publish/run.test.tlisp.
+      - uses: pleme-io/actions/step-summary-publish@main
+        with:
+          template: |
+            ### Publish withheld
+
+            Repository is private; nothing was published to {{registry}}.
+            The version was bumped and tagged.
+
+            If this repo is meant to publish a public artifact from private
+            source, set `publish-from-private: true`.
+          vars: '{"registry":"registry.npmjs.org"}'
+      # Folded scalar (`>-`): the message contains ": ", which a plain scalar
+      # would parse as a mapping. Folding joins the lines with single spaces, so
+      # the value the action receives is the one long sentence — do not reflow it
+      # in a way that introduces a double space or a blank line, both of which
+      # change the rendered annotation.
+      - uses: pleme-io/actions/annotation-publish@main
+        with:
+          level: notice
+          title: Publish withheld
+          message: >-
+            This repository is private, so the npm package was NOT published.
+            The version was bumped and tagged. Set publish-from-private: true
+            if this repo is meant to publish a public artifact from private
+            source.
