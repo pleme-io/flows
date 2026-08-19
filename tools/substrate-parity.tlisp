@@ -93,10 +93,21 @@
 ;; The other direction. Without this half the gate would pass a tree missing
 ;; entire flows, because it only ever walks what is already local — a flow added
 ;; to substrate and never mirrored here would be invisible.
+;; DECLARES it, not MENTIONS it. A bare substring match on "workflow_call" is
+;; what put substrate's own catalog-check.yml in this repo on day one: its
+;; comments discuss `workflow_call:` while its `on:` block has none, so it is
+;; not a reusable flow at all — and once mirrored here it self-triggered on
+;; push and failed. The file literally says "it has no `workflow_call:` and is
+;; correctly absent from the catalog", and the grep read the sentence saying so.
+;; Anchoring on the two-space-indented key under `on:` is the difference
+;; between a declaration and prose about one.
+(define (declares-workflow-call? p)
+  (string-contains? (read-file p) "\n  workflow_call:"))
+
 (define missing
   (filter
     (fn (p)
-      (and (string-contains? (read-file p) "workflow_call")
+      (and (declares-workflow-call? p)
            (not (path-exists? (string-append LOCAL-DIR "/" (path-basename p))))))
     (glob (string-append SUBSTRATE-DIR "/*.yml"))))
 

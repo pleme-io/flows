@@ -1,6 +1,6 @@
 # pleme-io/flows — the fleet's reusable workflow catalog
 
-**91 `workflow_call` workflows.** Sibling to [`pleme-io/actions`](https://github.com/pleme-io/actions)
+**90 `workflow_call` workflows.** Sibling to [`pleme-io/actions`](https://github.com/pleme-io/actions)
 (360 composite actions): actions are the *capabilities*, flows are the
 *orchestration* that composes them, and a consumer repo writes neither — it
 writes a ≤15-line shim that names a flow and passes values.
@@ -109,11 +109,19 @@ the first computed. Tracked as `pending-pipeline-delivery: ref-locking`.
 
 ## What stayed in substrate
 
-Seven workflows and two case tables, all of them substrate's own CI rather than
+Eight workflows and two case tables, all of them substrate's own CI rather than
 anything a consumer can call: `auto-bump` (its self-bump), `flakehub`,
-`nix-tests`, `sql-apply-image-release`, and the three selftests
+`nix-tests`, `sql-apply-image-release`, `catalog-check`, and the three selftests
 (`job-selection-selftest`, `devshell-cargo-test-selftest`, `doca-selftest`).
 None declares `workflow_call`, so none was ever callable cross-repo.
+
+`catalog-check` is worth naming because it briefly *did* land here, and the
+mistake is instructive: the move selected files containing the string
+`workflow_call`, and that file's comments discuss `workflow_call:` while its
+`on:` block has none — it says so itself, *"it has no `workflow_call:` and is
+correctly absent from the catalog"*. Mirrored here it self-triggered on push and
+failed. **The fleet-wide "91 reusable workflows" figure came from the same
+substring count and is likewise one too high; the measured number is 90.**
 
 ## Licence
 
