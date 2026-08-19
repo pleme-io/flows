@@ -42,13 +42,23 @@
 ;; assertion would instead fail every time a flow is legitimately added.
 (define MIN-FILES 40)
 
+;; This repo's OWN files, which have no substrate counterpart by design and
+;; must not be compared. Caught by the gate's first run against itself:
+;; substrate-parity.yml was reported EXTRA, which is true and is not drift.
+;; A gate that flags its own existence teaches people to ignore its output.
+(define NATIVE (list "substrate-parity.yml"))
+
 ;; Only files this repo is the home OF. substrate keeps its own CI — the
 ;; selftests, its self-bump, its flakehub publish — and those are deliberately
 ;; not mirrored, so comparing them would report a difference that is the
 ;; correct state.
+(define (native? n)
+  (> (length (filter (fn (x) (equal? x n)) NATIVE)) 0))
+
 (define (mirrored? n)
-  (or (string-ends-with? n ".yml")
-      (string-ends-with? n ".cases.tsv")))
+  (and (not (native? n))
+       (or (string-ends-with? n ".yml")
+           (string-ends-with? n ".cases.tsv"))))
 
 (define (compare-one n)
   (let ((mine (string-append LOCAL-DIR "/" n))
