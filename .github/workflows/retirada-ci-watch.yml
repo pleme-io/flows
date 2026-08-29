@@ -47,7 +47,7 @@ on:
       runner:
         required: false
         type: string
-        default: "camelot-builder-pleme-eks"
+        default: "the self-hosted builder pool"
 
 permissions:
   contents: read
