@@ -52,7 +52,7 @@ on:
         type: string
         default: ""
       extraSubstituters:
-        description: "Extra Nix binary-cache URL(s) to pull from (space-separated) -- e.g. the in-cluster sui super-cache daemon (http://sui.the private estate-build.svc) so heavy builds SUBSTITUTE instead of compiling. Same input shape as image-push.yml/nix-image-auto-release.yml's own extraSubstituters (mirrored here -- this reusable had never carried it, confirmed live: pitr-tools' function-release.yml, its sole consumer, had no cache knob at all despite self-routing onto the self-hosted builder pool). Empty (default) = no extra cache, zero blast radius for existing consumers."
+        description: "Extra Nix binary-cache URL(s) to pull from (space-separated) -- e.g. the in-cluster sui super-cache daemon (http://sui.<build-namespace>.svc) so heavy builds SUBSTITUTE instead of compiling. Same input shape as image-push.yml/nix-image-auto-release.yml's own extraSubstituters (mirrored here -- this reusable had never carried it, confirmed live: pitr-tools' function-release.yml, its sole consumer, had no cache knob at all despite self-routing onto the private-repo builder pool). Empty (default) = no extra cache, zero blast radius for existing consumers."
         type: string
         default: ""
       extraTrustedPublicKeys:
@@ -115,7 +115,7 @@ jobs:
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@main
         with:
-          github-token: ${{ secrets.BOT_PAT }}
+          github-token: ${{ secrets.BOT_PAT || secrets.GITHUB_TOKEN }}
           determinate: false
           extra-conf: |
             sandbox = relaxed

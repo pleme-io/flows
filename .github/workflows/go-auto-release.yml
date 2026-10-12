@@ -109,7 +109,7 @@ on:
         required: false
         default: "false"
       # Runner routing: empty default routes by CALLER repo visibility —
-      # private repos → the org-scoped self-hosted ARC pool (avoids billed
+      # private repos → the org-scoped self-hosted ARC pool named by vars.PRIVATE_BUILDER_RUNNER (avoids billed
       # hosted minutes; org runner groups refuse public repos anyway), public
       # repos → ubuntu-latest. Schedule-triggered callers may lack
       # github.event.repository and fall open to hosted (documented edge).
@@ -202,7 +202,7 @@ jobs:
       # relver is invoked via `nix run` (below) — the runner needs nix.
       - uses: DeterminateSystems/nix-installer-action@main
         with:
-          github-token: ${{ secrets.BOT_PAT }}
+          github-token: ${{ secrets.BOT_PAT || secrets.GITHUB_TOKEN }}
 
       # relver next = (changed-since-tag)+(compute-next)+(idempotent tag+push).
       # gen-spec-bot-style bot identity (matches git-commit-tag default).

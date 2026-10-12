@@ -135,7 +135,7 @@ on:
         type: boolean
         default: false
       extraSubstituters:
-        description: "Extra Nix binary-cache URL(s) to pull from (space-separated) -- e.g. the in-cluster sui super-cache daemon (http://sui.the private estate-build.svc) so heavy builds SUBSTITUTE instead of compiling. Same input shape as image-push.yml's own extraSubstituters (mirrored here -- this reusable had never carried it, confirmed live: every hardened-images build paid full cold-compile cost despite running on the same cluster/VPC sui lives on). Empty (default) = no extra cache, zero blast radius for existing consumers."
+        description: "Extra Nix binary-cache URL(s) to pull from (space-separated) -- e.g. the in-cluster sui super-cache daemon (http://sui.<build-namespace>.svc) so heavy builds SUBSTITUTE instead of compiling. Same input shape as image-push.yml's own extraSubstituters (mirrored here -- this reusable had never carried it, confirmed live: every hardened-images build paid full cold-compile cost despite running on the same cluster/VPC sui lives on). Empty (default) = no extra cache, zero blast radius for existing consumers."
         type: string
         default: ""
       extraTrustedPublicKeys:
@@ -147,7 +147,7 @@ on:
         type: string
         default: ""
       superCacheSaveEndpoint:
-        description: "sui super-cache endpoint to PUSH the just-built image-attr's store path to (e.g. http://sui.the private estate-build.svc), via pleme-io/actions/super-cache-save. The write half of extraSubstituters above -- without this, every consumer that reads from sui never contributes back, so a from-source overlay (e.g. hardened-images' custom erlang_26 build) recompiles from scratch on every single run forever, even after a successful build. Runs after the local build (scan-before-push's `nix build`, or a fresh build if scan-before-push is false) and before the CVE gates, since the cache write is a pure content-addressed store-path push independent of what the scans later decide -- a rebuild from the same cached bytes always re-scans identically. Best-effort (never fails the job on a push error -- see super-cache-save's own README). Empty (default) = no push, zero blast radius for existing consumers."
+        description: "sui super-cache endpoint to PUSH the just-built image-attr's store path to (e.g. http://sui.<build-namespace>.svc), via pleme-io/actions/super-cache-save. The write half of extraSubstituters above -- without this, every consumer that reads from sui never contributes back, so a from-source overlay (e.g. hardened-images' custom erlang_26 build) recompiles from scratch on every single run forever, even after a successful build. Runs after the local build (scan-before-push's `nix build`, or a fresh build if scan-before-push is false) and before the CVE gates, since the cache write is a pure content-addressed store-path push independent of what the scans later decide -- a rebuild from the same cached bytes always re-scans identically. Best-effort (never fails the job on a push error -- see super-cache-save's own README). Empty (default) = no push, zero blast radius for existing consumers."
         type: string
         default: ""
       sbom-attest:
@@ -357,7 +357,7 @@ jobs:
       #
       # WHY, measured: hardened-images run 30665557380 (release-clickhouse-keeper)
       # died with
-      #   error: unable to download 'http://sui.the private estate-build.svc/....narinfo':
+      #   error: unable to download 'http://sui.<build-namespace>.svc/....narinfo':
       #          Timeout was reached (28) Connection timed out after 15001 ms
       # after ~20 retries across four store paths. The build never reached its
       # compile step, let alone its CVE gate or boot-check.
@@ -456,7 +456,7 @@ jobs:
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@main
         with:
-          github-token: ${{ secrets.BOT_PAT }}
+          github-token: ${{ secrets.BOT_PAT || secrets.GITHUB_TOKEN }}
           determinate: false
           extra-conf: |
             sandbox = relaxed
@@ -758,3 +758,21 @@ jobs:
             cartorio-sbom.cdx.json
             cartorio-slsa.json
           if-no-files-found: warn
+
+# 2026-09-16: no-op touch to move this file's blob, deliberately.
+#
+# akeylesslabs/drill-tools' image-release lane (named pitr-tools at the time) has returned startup_failure on
+# every run since 2026-08-25 while calling THIS path. A four-probe bisection
+# ruled out the content (a byte-identical LOCAL copy starts), the inputs (it
+# fails with none declared), secrets: inherit, and cross-org resolution (a
+# sibling reusable in this same repo resolves from the same caller on the same
+# branch). What remained was the resolution of this one path for that one
+# caller — the shape of a cached bad state on GitHub's side rather than
+# anything in these bytes.
+#
+# A startup failure exposes no message through the API (runs/<id>/jobs returns
+# zero jobs; the commit check-runs carry no output), so the cheapest remaining
+# probe was to change the blob this @main reference resolves to. If the caller
+# starts after this commit, the cache hypothesis is confirmed and this comment
+# is the record of why. If it does not, the hypothesis is refuted and the next
+# step is reading the annotation in the Actions UI.

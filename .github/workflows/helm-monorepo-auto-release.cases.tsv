@@ -73,7 +73,7 @@ bot-actor-self-trigger-guard	github.actor=github-actions[bot];github.event.repos
 # which was previously asserted rather than checked. Measured today with an
 # anonymous GHCR token (no credentials):
 #
-#   ghcr.io/pleme-io/charts/lareira-the private estate-observe   HTTP 404
+#   ghcr.io/pleme-io/charts/<a-private-chart>   HTTP 404
 #   ghcr.io/pleme-io/charts/pleme-lib                 HTTP 403
 #   ghcr.io/pleme-io/charts/lareira-akeyless-saas     HTTP 403
 #   ghcr.io/pleme-io/helm/pleme-lareira               HTTP 403

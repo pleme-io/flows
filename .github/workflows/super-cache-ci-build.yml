@@ -4,7 +4,7 @@
 # sui-service stack; a super-cache build is a THREADING of these verbs, not a
 # monolith (★★ CLOSED-LOOP MASS-SYNTHESIS rule 2 — small verbs, no orchestrator).
 #
-#   breathe-runner   → assert breathable spot / isolated-pool posture, arm drain
+#   breathe-runner   → assert breathable spot / builder-taint posture, arm drain
 #   sui-service-up    → resolve + export the sui daemon endpoint + backend tiers
 #   gen-build-spec    → typed *.build-spec.json + GEN-TYPED-SPEC-CONTRACT stale gate
 #   super-cache-restore → warm path: probe the tiered super-cache
@@ -70,11 +70,14 @@ on:
         default: "amd64"
       runner:
         description: >-
-          JSON array of runner labels. Default is the the private estate in-cluster spot
-          runner. For a hosted-runner dry-run pass '[\"ubuntu-latest\"]' AND
-          enforce-posture=false.
+          JSON array of runner labels — a build cell is selected by a label SET
+          (self-hosted + pool + arch), not by one name. REQUIRED when
+          enforce-posture is true: a workflow_call default must be STATIC so it
+          cannot read vars, and baking a pool name here would couple every
+          consumer to one estate's cluster identity. For a hosted-runner
+          dry-run pass '[\"ubuntu-latest\"]' AND enforce-posture=false.
         type: string
-        default: '["self-hosted", "the private estate", "amd64"]'
+        default: '["ubuntu-latest"]'
       sui-mode:
         description: "connect | ephemeral — sui-service-up backend profile. connect = the never-touch-disk destination (Pg/Redis/tmpfs)."
         type: string
@@ -236,7 +239,7 @@ jobs:
       # pipeline PRODUCES them. Gated on inputs.security-layers.
       #
       # TIER-HONEST: these run wherever the job runs; the live end-to-end (a
-      # real derive through a stood-up sui service on the the private estate in-cluster
+      # real derive through a stood-up sui service on the in-cluster
       # ARC runner) is the pipeline's existing named LiveTODO. The steps
       # thread + execute the standard tools today; a digest-output from
       # ghcr-publish (so L-sign binds a @sha256: without a tag→digest resolve)

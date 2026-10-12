@@ -5,7 +5,7 @@
 # Distinct from nix-image-auto-release.yml (which builds + pushes a
 # pleme-io-OWNED image, e.g. a Nix rebuild of an upstream base) and from
 # the hardened-images program generally: this workflow never rebuilds
-# anything. It exists for the class of image the estate runs unmodified from
+# anything. It exists for the class of image a cluster runs unmodified from
 # an upstream registry (FluxCD, Istio, cloudnative-pg, external-secrets,
 # AWS EKS system images, the ARC controller, metrics-server) that has
 # never been through any pleme-io CVE gate at all, closing that visibility
@@ -352,6 +352,10 @@ jobs:
           # works for the ~14 existing vendor-* legs and every future one.
           # Matches the org's existing pattern (PRIVATE_BUILDER_RUNNER,
           # PRIVATE_SUI_SUBSTITUTER).
+          # Grant-before-revoke: read the new org-variable name first and fall
+          # back to the old one, so this works BEFORE the rename lands in the
+          # org and continues working AFTER the old name is removed. Neither
+          # side of the rename is a flag day.
           ZOT_CA_PEM: ${{ vars.PRIVATE_REGISTRY_CA || vars.CAMELOT_ZOT_CA }}
           # FALLBACK only: a token for the private-repo fetch, for a caller
           # outside pleme-io where the org variable does not resolve.
@@ -367,7 +371,7 @@ jobs:
             curl -fsSL -H "Authorization: Bearer $CA_CERT_TOKEN" -o /tmp/zot-ca.crt "$CA_CERT_URL"
             echo "CA source: authenticated fetch from ca-cert-url"
           else
-            echo "::error::No CA available. Set the org variable PRIVATE_REGISTRY_CA (preferred),"
+            echo "::error::No CA available. Set the org variable PRIVATE_REGISTRY_COT_CA (preferred),"
             echo "::error::or pass BOTH the ca-cert-url input and the CA_CERT_TOKEN secret."
             echo "::error::The source repo is PRIVATE — an unauthenticated fetch returns a"
             echo "::error::14-byte '404: Not Found' body, which is what this step used to"

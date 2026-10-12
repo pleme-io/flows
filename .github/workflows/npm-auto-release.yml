@@ -30,7 +30,7 @@ on:
         required: false
         default: "package.json package-lock.json"
       # Runner routing: empty default routes by CALLER repo visibility —
-      # private repos → the org-scoped self-hosted ARC pool (avoids billed
+      # private repos → the org-scoped self-hosted ARC pool named by vars.PRIVATE_BUILDER_RUNNER (avoids billed
       # hosted minutes; org runner groups refuse public repos anyway), public
       # repos → ubuntu-latest. Schedule-triggered callers may lack
       # github.event.repository and fall open to hosted (documented edge).

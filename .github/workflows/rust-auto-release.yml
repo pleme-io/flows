@@ -67,7 +67,7 @@ on:
         required: false
         default: "true"
       # Runner routing: empty default routes by CALLER repo visibility —
-      # private repos → the org-scoped self-hosted ARC pool (avoids billed
+      # private repos → the org-scoped self-hosted ARC pool named by vars.PRIVATE_BUILDER_RUNNER (avoids billed
       # hosted minutes; org runner groups refuse public repos anyway), public
       # repos → ubuntu-latest. Schedule-triggered callers (the drip tick) may
       # lack github.event.repository and fall open to hosted (documented edge).
@@ -161,9 +161,60 @@ jobs:
   bump:
     name: Bump workspace + tag
     runs-on: ${{ inputs.runner != '' && inputs.runner || (github.event.repository.private && (vars.PRIVATE_BUILDER_RUNNER || 'ubuntu-latest') || 'ubuntu-latest') }}
-    # Skip when the bot itself pushed (avoids tag-push → bump → tag-push loops)
-    # and on the scheduled drip tick (a capacity-ride must never bump/tag).
-    if: github.actor != 'github-actions[bot]' && github.event_name != 'schedule'
+    # ── The TAG waits for the test gate ───────────────────────────────────
+    # The tag this job pushes is itself a release: tag-triggered workflows
+    # (binary builds, GitHub Releases marked Latest) fire on it, and a private
+    # repo ships nothing else, because `ship` and `drip` both skip on
+    # `github.event.repository.private`. Until 2026-09-19 this job had no
+    # `needs:` and ran in PARALLEL with `test`, so only the crates.io publish
+    # waited for the gate. Receipt, engenho auto-release run 35396380114
+    # (2026-09-18 UTC): its bump tagged v0.53.117 at 21:27:13 and had pushed
+    # it by 21:27:21, when the tag-triggered `release` run started; its own
+    # Test gate went red at 21:33:33; the tag's GitHub Release was published
+    # at 21:33:49 regardless.
+    #
+    # The condition is written out because a plain `needs: test` is WRONG
+    # here: under GitHub's implicit `success()` a SKIPPED dependency skips the
+    # dependent, and `test` skips whenever a repo waives tests
+    # (`require-tests: false`). That would stop every waiving repo from ever
+    # tagging again. Naming a status function removes the implicit
+    # `success()`, and the explicit clause then admits exactly two states:
+    # the gate passed, or it was waived and therefore skipped. A failed or
+    # cancelled gate matches neither.
+    #
+    # `!cancelled()` is load-bearing on its own: an operator cancel that lands
+    # after `test` passed but before this job starts must not tag. `always()`
+    # would tag in that window, which is why this is not `always()`.
+    #
+    #
+    # The two guards that were here before are unchanged: skip when the bot
+    # itself pushed (avoids tag-push → bump → tag-push loops) and on the
+    # scheduled drip tick (a capacity-ride must never bump/tag).
+    #
+    # Cost, stated rather than hidden: the release now takes test + bump
+    # wall-clock instead of max(test, bump), and the window in which a human
+    # push can land on main before this job's push widens by the test's
+    # duration. git-push-with-token rebases onto such a push and re-points the
+    # tag, so the tag can then cover a commit this run did not test. That
+    # window existed before; it is longer now.
+    # `waiver` is in `needs` so that its FAILURE blocks the tag. It runs on
+    # every invocation and errors only for `require-tests: false` with an empty
+    # `require-tests-waiver`. Before this, `bump` depended on `test` alone, so
+    # that error was a red job beside a tag that had already been pushed — the
+    # typed-reason rule was advisory in exactly the case it exists for.
+    needs: [test, waiver]
+    if: >-
+      !cancelled()
+      && github.actor != 'github-actions[bot]'
+      && github.event_name != 'schedule'
+      && (
+        needs.test.result == 'success'
+        || (
+          inputs.require-tests == false
+          && needs.test.result == 'skipped'
+          && needs.waiver.result == 'success'
+        )
+      )
     outputs:
       bumped: ${{ steps.bump.outputs.bumped }}
       new-version: ${{ steps.bump.outputs.new-version }}
@@ -263,7 +314,8 @@ jobs:
     # is itself skipped, so `needs: bump` here would skip the gate on every
     # schedule tick — and `drip`'s scheduled arm would then be blocked by a
     # SKIP, regressing the exact never-published hole drip exists to close.
-    # Running in parallel with bump also halves wall-clock.
+    # The dependency runs the other way instead: `bump` needs THIS job, so no
+    # tag is cut until the gate has passed (or was waived). See bump's header.
     #
     # Consequence to state rather than hide: this verifies the PRE-bump tree,
     # while `ship` re-checkouts main and publishes the POST-bump tree. Only
@@ -284,9 +336,46 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Nix
-        uses: DeterminateSystems/nix-installer-action@main
+        # ── WHY THE `||` FALLBACK (added 2026-08-27, after it bit sui) ──────
+        # This input becomes `access-tokens = github.com=<token>` in nix.conf,
+        # so nix attaches it to EVERY github.com fetch -- including PUBLIC
+        # repos. A dead or malformed PAT is therefore WORSE THAN NO TOKEN:
+        # GitHub answers 401 "Bad credentials" instead of serving the repo
+        # anonymously, so a public fetch that needs no auth at all fails.
+        #
+        # Measured on pleme-io/sui: the Test gate below does
+        # `builtins.getFlake "github:pleme-io/substrate"` -- substrate is
+        # PUBLIC -- and died on
+        #   api.github.com/repos/pleme-io/substrate/commits/HEAD -> HTTP 401
+        # for 16 consecutive scheduled ticks. Not a scope problem: image-push's
+        # own diagnostic states it, a valid-but-underscoped token 404s, only an
+        # invalid one 401s.
+        #
+        # The token's job HERE is rate-limit headroom on public fetches (60/hr
+        # anonymous vs 5000/hr authenticated), not authorization. GITHUB_TOKEN
+        # is always present and always valid, so falling back to it means an
+        # expired BOT_PAT degrades to "public fetches keep working" instead of
+        # "every fetch 401s". A live BOT_PAT still wins, so private inputs are
+        # unaffected.
+        #
+        # This does NOT excuse the dead credential -- rotate BOT_PAT. It stops
+        # one expired secret from taking out the public path fleet-wide.
+        #
+        # One step now, not two: nix-setup installs Nix AND realises
+        # substrate's pinned cargo-nextest, so this workflow stops carrying a
+        # second copy of the install-then-fetch shape. It passes the token the
+        # same way, for the reason above.
+        #
+        # pending-expired-token-fallback: `||` is FALSY-only, so it covers an
+        # ABSENT BOT_PAT and not an expired-but-present one — the exact shape
+        # that bit sui. nix-setup's own `inputs.github-token || github.token`
+        # has the same gap. Closing it needs a liveness probe on the token
+        # before it reaches nix.conf, in nix-setup, not here.
+        uses: pleme-io/actions/nix-setup@main
+        id: nix
         with:
-          github-token: ${{ secrets.BOT_PAT }}
+          github-token: ${{ secrets.BOT_PAT || secrets.GITHUB_TOKEN }}
+          nextest: "true"
 
       # Same private-git-dep credential fix as nix-devshell-cargo-test.yml:
       # nix-installer's github-token covers NIX's fetcher only, never CARGO's
@@ -332,16 +421,12 @@ jobs:
              devShells = (builtins.getFlake (toString ./.)).devShells or {};
            }' >> "$GITHUB_OUTPUT"
 
-      # nextest comes from substrate's pin as an absolute store path, NOT
-      # from the consumer's devShell — 20 of 52 consumers pin substrate at
-      # 2026-06-07, so anything added to their shell reaches them only after
-      # they re-lock, and a consumer can replace `extraPackages` outright.
-      - name: Fetch the anti-vacuity runner
-        id: nextest
-        run: |
-          out=$(nix build --no-link --print-out-paths github:pleme-io/substrate#cargo-nextest)
-          echo "bin=$out/bin/cargo-nextest" >> "$GITHUB_OUTPUT"
-
+      # nextest is nix-setup's `nextest-bin`: substrate's pin, as an ABSOLUTE
+      # store path, never the consumer's devShell. 20 of 52 consumers pin
+      # substrate at 2026-06-07, so anything added to their shell reaches them
+      # only after they re-lock, and a consumer can replace `extraPackages`
+      # outright. Invoking by absolute path is what makes that unshadowable.
+      #
       # `--no-tests=fail` IS the anti-vacuity assertion, and it is a flag on
       # an existing tool rather than a gate of our own. `cargo test` exits 0
       # when it runs zero tests — measured on three shapes (no tests at all,
@@ -355,7 +440,7 @@ jobs:
         run: |
           echo "::notice::test gate tier=${{ steps.env.outputs.tier }} shell=${{ steps.env.outputs.installable }} granularity=${{ inputs.test-granularity }}"
           nix develop "${{ steps.env.outputs.installable }}" -c \
-            "${{ steps.nextest.outputs.bin }}" nextest run --no-tests=fail ${{ inputs.test-args }}
+            "${{ steps.nix.outputs.nextest-bin }}" nextest run --no-tests=fail ${{ inputs.test-args }}
 
   ship:
     name: Ship workspace to registry
