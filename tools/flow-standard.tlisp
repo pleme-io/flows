@@ -80,6 +80,14 @@
         0
         (fail-line (string-append "NAME    " n ": the one top-level name: must be " (stem n))))))
 
+(define (take-n xs k) (if (or (null? xs) (= k 0)) (list) (cons (car xs) (take-n (cdr xs) (- k 1)))))
+
+(define (check-summary n ls)
+  (let ((heads (filter (fn (l) (re-match? "^#.+" l)) (take-n ls 12))))
+    (if (and (not (null? heads)) (>= (string-length (string-trim (re-replace "^#\\s*" (car heads) ""))) 10))
+        0
+        (fail-line (string-append "SUMMARY " n ": no column-0 # summary of 10+ characters in the first 12 lines")))))
+
 (define (check-self-refs n ls)
   (sum (map (fn (l) (fail-line (string-append "SELFREF " n ": " (string-trim l) " — a flow calls a sibling as ./.github/workflows/<flow>.yml")))
             (filter (fn (l) (re-match? "^\\s+uses: pleme-io/(substrate|flows)/\\.github/workflows/" l)) ls))))
@@ -122,7 +130,7 @@
 
 (define (check-flow p)
   (let ((n (path-basename p)) (ls (lines-of p)))
-    (+ (check-call n ls) (check-name n ls) (check-routes n ls) (check-runner-input n ls)
+    (+ (check-call n ls) (check-name n ls) (check-summary n ls) (check-routes n ls) (check-runner-input n ls)
        (check-self-refs n ls) (check-permissions n ls) (check-catalog n ls))))
 
 (define names (map path-basename flows))

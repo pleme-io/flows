@@ -91,7 +91,7 @@ rendering equal to its definition.
 |---|---|
 | Runner route | Every job `runs-on: ${{ inputs.runner != '' && inputs.runner \|\| (github.event.repository.private && (vars.PRIVATE_BUILDER_RUNNER \|\| 'pleme-private') \|\| 'ubuntu-latest') }}`, or `${{ needs.<job>.outputs.runner }}` from a `runner-resolve` job. A typed exception (a matrix, a label array, a platform pin such as `rio` or `macos`, the oldest-glibc job) is a row in `ROUTE-EXCEPTIONS`, with its reason. |
 | Runner input | A flow that routes declares the one `runner` input: type string, default `""`, the one description. |
-| Header | One top-level `name:`, equal to the file stem. `on:` declares `workflow_call:` at indent 2. |
+| Header | A column-0 `#` summary of 10 or more characters in the first 12 lines (the rule substrate's `checks.workflow-catalog` also holds). One top-level `name:`, equal to the file stem. `on:` declares `workflow_call:` at indent 2. |
 | Sibling call | A flow calls a sibling as `./.github/workflows/<flow>.yml`. A `./` call resolves in the repository of the calling flow, so the catalog calls itself and the cutover touches consumers only. |
 | Permissions | A top-level `permissions:` block. The 40 flows without one are listed in `tools/permissions-ledger.txt`. The ledger only shrinks: the gate fails when a listed flow gets a block and stays listed. |
 | Catalog | [`catalog/workflows.lisp`](./catalog/workflows.lisp) is the source. Each flow has one `(defworkflow …)` row, and its `:inputs` equal the inputs the flow declares. `substrate/catalog/workflows.lisp` is a mirror, and `substrate-parity` compares it. |
