@@ -138,7 +138,9 @@ instead of the YAML.
 
 ## Status — this repo is the home, substrate is still the address
 
-**Nothing references this repo yet. Do not repoint a consumer by hand.**
+**Five canary repos reference this repo (2026-10-24): lava-splunk,
+lava-operator, pangea-tls, shikumi-go, irodori. Do not repoint a consumer
+by hand; the cutover tool does it.**
 
 Created 2026-08-19. The fleet's 1751 references across ~759 repos still resolve
 `pleme-io/substrate/.github/workflows/…@main`, and both trees are kept
@@ -163,6 +165,34 @@ That sweep should happen **together with** the pending reference-locking work,
 because both rewrite the same 1751 references and doing them separately means
 rewriting every consumer twice — with the second pass invalidating every lock
 the first computed. Tracked as `pending-pipeline-delivery: ref-locking`.
+
+### The cutover tool
+
+[`tools/cutover.b`](./tools/cutover.b) (blue) rewrites every
+`pleme-io/substrate/.github/workflows/X@ref` on a `uses:` line to
+`pleme-io/flows/.github/workflows/X@ref`, and keeps the ref. It rewrites a
+reference only when flows holds `X` and `X` declares `workflow_call:`; any
+other reference stays and is listed as `missing` or `no-ref`. It skips the
+`substrate` and `flows` trees. It scans `.github/workflows/*.y{a,}ml` and
+`.github/workflow-templates/*.yml` one level under the root. Blue's `glob`
+finds nothing for an absolute pattern, so run it from the org directory with
+the root `.`.
+
+| Mode | It does |
+|---|---|
+| `plan FLOWS OUT .` | Writes the ledger `OUT` (repo, path, line, flow, ref, status). Changes nothing. |
+| `write FLOWS OUT .` | `plan`, and rewrites the files. Commits nothing. |
+| `push FLOWS OUT .` | Per repo: refuses a dirty tree, a branch other than `main`, or a fetch that does not fast-forward; then rewrites, commits, and pushes to `main`. `OUT` lists each repo's result. A second run finds nothing to do. |
+| `search FLOWS OUT` | GitHub code search, one query per flow, 7 s apart (the limit is 10 a minute). Lists the files the org holds, cloned or not. |
+
+Dry run, 2026-10-24, over `~/code/github/pleme-io` (one level, agent
+worktrees not scanned): 1,994 workflow files, 1,776 references; 1,720
+rewritable in 1,620 files in 776 repos; 0 missing; 56 in the substrate and
+flows trees (skipped). `rg --no-ignore --hidden` over the same files counts
+the same 1,776. Not covered by the tool: `substrate/templates/fleet` (one
+reference, in a template that renders new repos); change it in the
+cutover commit to substrate.
+
 
 ## What stayed in substrate
 
