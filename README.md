@@ -1,7 +1,7 @@
 # pleme-io/flows — the fleet's reusable workflow catalog
 
-**90 `workflow_call` workflows.** Sibling to [`pleme-io/actions`](https://github.com/pleme-io/actions)
-(360 composite actions): actions are the *capabilities*, flows are the
+**93 `workflow_call` workflows** (counted by `tools/flow-standard.tlisp`, 2026-10-24). Sibling to [`pleme-io/actions`](https://github.com/pleme-io/actions)
+(380 action directories, 2026-10-24): actions are the *capabilities*, flows are the
 *orchestration* that composes them, and a consumer repo writes neither — it
 writes a ≤15-line shim that names a flow and passes values.
 
@@ -78,6 +78,63 @@ repo — one per family member — so adopting a flow is a picker entry in
   from an existing one by a conditional is an input to that one.
 - **Extract on the second repo, not the third.** A job shape appearing in a
   second repo belongs in the family.
+
+## The standard shapes — one definition each, gated
+
+[`tools/flow-standard.tlisp`](./tools/flow-standard.tlisp) holds each shape
+once, and [`flow-standard`](.github/workflows/flow-standard.yml) fails a push
+that breaks one. GitHub has no way to share an expression between workflow
+files, so the YAML is a rendering of these definitions, and the gate keeps every
+rendering equal to its definition.
+
+| Shape | The rule |
+|---|---|
+| Runner route | Every job `runs-on: ${{ inputs.runner != '' && inputs.runner \|\| (github.event.repository.private && (vars.PRIVATE_BUILDER_RUNNER \|\| 'pleme-private') \|\| 'ubuntu-latest') }}`, or `${{ needs.<job>.outputs.runner }}` from a `runner-resolve` job. A typed exception (a matrix, a label array, a platform pin such as `rio` or `macos`, the oldest-glibc job) is a row in `ROUTE-EXCEPTIONS`, with its reason. |
+| Runner input | A flow that routes declares the one `runner` input: type string, default `""`, the one description. |
+| Header | One top-level `name:`, equal to the file stem. `on:` declares `workflow_call:` at indent 2. |
+| Sibling call | A flow calls a sibling as `./.github/workflows/<flow>.yml`. A `./` call resolves in the repository of the calling flow, so the catalog calls itself and the cutover touches consumers only. |
+| Permissions | A top-level `permissions:` block. The 40 flows without one are listed in `tools/permissions-ledger.txt`. The ledger only shrinks: the gate fails when a listed flow gets a block and stays listed. |
+| Catalog | [`catalog/workflows.lisp`](./catalog/workflows.lisp) is the source. Each flow has one `(defworkflow …)` row, and its `:inputs` equal the inputs the flow declares. `substrate/catalog/workflows.lisp` is a mirror, and `substrate-parity` compares it. |
+
+The gate is tatara-lisp and not blue: a CI runner has no blue binary to fetch
+(blue has no release and no flake output, 2026-10-24). The same blocker holds
+new `run.b` actions in `pleme-io/actions`. The first step is a blue release
+that a runner can install, and then one blue runner action that every `run.b`
+action reuses.
+
+## Reuse ledger — `run:` logic still in flows, ranked
+
+Measured 2026-10-24 over the 93 flows: 160 `run:` blocks, 86 with logic
+(a comparison, a loop, `||`/`&&`, an exit code or `::error`), 1,263 lines,
+in 35 flows. Each row moves to a `pleme-io/actions` action (`run.b`, after
+the blue runner exists), largest first.
+
+| # | Class | Flows | Logic lines |
+|---|---|---|---|
+| 1 | Binary release matrix | rust-binary-release (8 blocks), go-binary-release (3) | 230 |
+| 2 | Image build, scan and push legs | image-push (7), vendor-image-mirror, nix-image-auto-release | 219 |
+| 3 | caixa family | caixa-publish, caixa-forge, caixa-publish-tlisp, caixa-validate | 186 |
+| 4 | Chart test and release | helm-unittest (one 147-line block), helm-auto-release, helm-monorepo-auto-release | 183 |
+| 5 | Ansible collection family | integration-live, published-install, auto-bump, ci, matrix | 121 |
+| 6 | Language auto-release legs | go-auto-release, rust-auto-release, auto-release, gem-auto-bump, crossplane-function-auto-release | 106 |
+| 7 | Provider publish family (one general flow under `pleme-iac`) | pulumi-provider-publish, crossplane-provider-publish, steampipe-plugin-publish | 95 |
+| 8 | The rest | reusable-autoheal, action-release, cse-audit, ghcr-retention, cargo-ci, nix-devshell-cargo-test | 79 |
+| 9 | esteira-rio | esteira-rio-bump, esteira-rio-release | 44 |
+| — | Private git credential and netrc, inside 2 and 6 | image-push, rust-auto-release (inline `insteadOf`). `pleme-io/actions/git-credentials` needs an explicit `token` input first, because these flows take `steps.token.outputs.token \|\| secrets.GHCR_TOKEN` | — |
+
+Done in this pass: `nix-image-auto-release-slim` forwards to
+`nix-image-auto-release` (434 lines to 147, logic blocks 2 to 0), and 28
+sibling calls in 13 flows became `./` calls.
+
+## Alignment with blue's pipeline
+
+Blue's SDLC design makes a workflow a rendering of the Bluefile, run by the
+blue binary (`pleme-io/blue` docs/TESTING.md and docs/REGISTRY.md; neither is
+on blue `main` yet, 2026-10-24; `reusable-flakehub` already says that blue's
+registry renders its callers). The shapes above are what that renderer emits:
+one route expression, one `runner` input, `name:` equal to the stem, `./`
+sibling calls, and one catalog row per flow whose `:inputs` the renderer reads
+instead of the YAML.
 
 ## Status — this repo is the home, substrate is still the address
 

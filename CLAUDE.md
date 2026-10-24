@@ -2,10 +2,11 @@
 
 > **★★★ CSE / Knowable Construction.** This repo operates under **Constructive Substrate Engineering** — canonical specification at [`pleme-io/theory/CONSTRUCTIVE-SUBSTRATE-ENGINEERING.md`](https://github.com/pleme-io/theory/blob/main/CONSTRUCTIVE-SUBSTRATE-ENGINEERING.md). The Compounding Directive (operational rules: solve once, load-bearing fixes only, idiom-first, models stay current, direction beats velocity) is in the org-level pleme-io/CLAUDE.md ★★★ section. Read both before non-trivial changes.
 
-The fleet's reusable `workflow_call` catalog — 90 flows, sibling to
-`pleme-io/actions`' 360 composite actions. Read [`README.md`](./README.md)
-first; it carries the ladder, the eleven-flow general family, and the rules a
-flow must obey.
+The fleet's reusable `workflow_call` catalog, sibling to `pleme-io/actions`
+(counts: README, measured by `tools/flow-standard.tlisp`). Read
+[`README.md`](./README.md) first; it carries the ladder, the eleven-flow
+general family, the standard shapes, and the rules a flow must obey. Edit the
+catalog in `catalog/workflows.lisp` here; substrate holds its mirror.
 
 ## Before you touch anything here
 

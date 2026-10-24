@@ -1,0 +1,22 @@
+name: flow-standard
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  standard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check every flow against the standard shapes and the catalog
+        uses: pleme-io/actions/tatara-script@main
+        with:
+          script-file: tools/flow-standard.tlisp

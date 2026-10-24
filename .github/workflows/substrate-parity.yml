@@ -40,7 +40,9 @@ jobs:
         with:
           repository: pleme-io/substrate
           path: substrate
-          sparse-checkout: .github/workflows
+          sparse-checkout: |
+            .github/workflows
+            catalog
           sparse-checkout-cone-mode: false
 
       - name: Compare every flow against substrate

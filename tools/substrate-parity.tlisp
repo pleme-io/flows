@@ -46,7 +46,7 @@
 ;; must not be compared. Caught by the gate's first run against itself:
 ;; substrate-parity.yml was reported EXTRA, which is true and is not drift.
 ;; A gate that flags its own existence teaches people to ignore its output.
-(define NATIVE (list "substrate-parity.yml"))
+(define NATIVE (list "substrate-parity.yml" "flow-standard.yml"))
 
 ;; Only files this repo is the home OF. substrate keeps its own CI — the
 ;; selftests, its self-bump, its flakehub publish — and those are deliberately
@@ -118,10 +118,21 @@
     acc)
   0 missing)
 
+(define catalog-drift
+  (cond
+    ((not (path-exists? "substrate/catalog/workflows.lisp"))
+      (print-line "DIFFERS catalog/workflows.lisp — absent in substrate")
+      1)
+    ((not (equal? (read-file "catalog/workflows.lisp") (read-file "substrate/catalog/workflows.lisp")))
+      (print-line "DIFFERS catalog/workflows.lisp — the catalog source is here, substrate holds its mirror")
+      1)
+    (else 0)))
+
 (print-line
   (string-append
     "result: " (string-format "{}" (- (length local-files) drift))
     "/" (string-format "{}" (length local-files)) " identical, "
-    (string-format "{}" (length missing)) " missing"))
+    (string-format "{}" (length missing)) " missing, catalog "
+    (if (= catalog-drift 0) "identical" "differs")))
 
-(exit (if (> (+ drift (length missing)) 0) 1 0))
+(exit (if (> (+ drift catalog-drift (length missing)) 0) 1 0))
