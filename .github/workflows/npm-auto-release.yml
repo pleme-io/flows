@@ -61,6 +61,10 @@ on:
         type: string
         required: false
         default: "false"
+      token-source:
+        description: 'Where each job takes its GitHub token (pleme-io/actions/github-token): app (default) is the short-lived installation token the self-hosted runner host mints from the fleet App, absent on hosted runners, where GITHUB_TOKEN is presented instead; pat presents BOT_PAT; none presents nothing.'
+        type: string
+        default: 'app'
     secrets:
       # required:false, deliberately. GitHub validates the WHOLE reusable call
       # graph at startup, BEFORE any job `if:` is evaluated, so a
@@ -74,6 +78,7 @@ on:
       NPM_TOKEN:
         required: false
       BOT_PAT:
+        description: "Long-lived PAT, presented only when token-source is pat."
         required: false
 
 permissions:
@@ -81,16 +86,21 @@ permissions:
 
 jobs:
   bump:
-    runs-on: ${{ inputs.runner != '' && inputs.runner || (github.event.repository.private && (vars.PRIVATE_BUILDER_RUNNER || 'ubuntu-latest') || 'ubuntu-latest') }}
+    runs-on: ${{ inputs.runner != '' && inputs.runner || (github.event.repository.private && (vars.PRIVATE_BUILDER_RUNNER || 'pleme-private') || 'ubuntu-latest') }}
     if: github.actor != 'github-actions[bot]'
     outputs:
       bumped: ${{ steps.bump.outputs.bumped }}
       new-version: ${{ steps.bump.outputs.new-version }}
     steps:
+      - id: token
+        uses: pleme-io/actions/github-token@main
+        with:
+          source: ${{ inputs.token-source }}
+          pat: ${{ secrets.BOT_PAT }}
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          token: ${{ secrets.BOT_PAT || secrets.GITHUB_TOKEN }}
+          token: ${{ steps.token.outputs.token || secrets.GITHUB_TOKEN }}
 
       - id: bump
         uses: pleme-io/actions/npm-bump@main
@@ -107,13 +117,13 @@ jobs:
       - if: steps.bump.outputs.bumped == 'true'
         uses: pleme-io/actions/git-push-with-token@main
         with:
-          token: ${{ secrets.BOT_PAT || secrets.GITHUB_TOKEN }}
+          token: ${{ steps.token.outputs.token || secrets.GITHUB_TOKEN }}
           branch: main
           push-tags: "true"
 
   ship:
     needs: bump
-    runs-on: ${{ inputs.runner != '' && inputs.runner || (github.event.repository.private && (vars.PRIVATE_BUILDER_RUNNER || 'ubuntu-latest') || 'ubuntu-latest') }}
+    runs-on: ${{ inputs.runner != '' && inputs.runner || (github.event.repository.private && (vars.PRIVATE_BUILDER_RUNNER || 'pleme-private') || 'ubuntu-latest') }}
     # The private guard carries its own escape hatch, and its skip is ANNOUNCED
     # by `publish-withheld` below. A bare `&& !private` here would be the exact
     # defect this change exists to remove: on 2026-08-08 graphql-synthesizer ran
@@ -124,11 +134,16 @@ jobs:
       needs.bump.outputs.bumped == 'true'
       && (!github.event.repository.private || inputs.publish-from-private == 'true')
     steps:
+      - id: token
+        uses: pleme-io/actions/github-token@main
+        with:
+          source: ${{ inputs.token-source }}
+          pat: ${{ secrets.BOT_PAT }}
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
           ref: main
-          token: ${{ secrets.BOT_PAT || secrets.GITHUB_TOKEN }}
+          token: ${{ steps.token.outputs.token || secrets.GITHUB_TOKEN }}
 
       - uses: pleme-io/actions/npm-publish@main
         with:
@@ -161,7 +176,7 @@ jobs:
       && needs.bump.outputs.bumped == 'true'
       && github.event.repository.private
       && inputs.publish-from-private != 'true'
-    runs-on: ${{ inputs.runner != '' && inputs.runner || (github.event.repository.private && (vars.PRIVATE_BUILDER_RUNNER || 'ubuntu-latest') || 'ubuntu-latest') }}
+    runs-on: ${{ inputs.runner != '' && inputs.runner || (github.event.repository.private && (vars.PRIVATE_BUILDER_RUNNER || 'pleme-private') || 'ubuntu-latest') }}
     permissions:
       contents: read
     steps:

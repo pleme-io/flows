@@ -6,9 +6,13 @@ on:
   workflow_call:
     inputs:
       runner-labels:
-        description: 'JSON array of runner labels every job runs on. The default is the private self-hosted pool (plo).'
+        description: 'JSON array of runner labels every job runs on. The default is the private self-hosted pool (rio and plo).'
         type: string
         default: '["self-hosted","pleme-private"]'
+      eval-runner-labels:
+        description: 'JSON array of runner labels for the jobs that evaluate the flake (eval and advisory checks, node toplevels, the flake-update verify), whose evaluation runs inside the runner unit. Empty is runner-labels. The fleet pools: pleme-eval-heavy is plo, whose runner holds a toplevel evaluation.'
+        type: string
+        default: ''
       system:
         description: 'The system checks are read from: checks.<system>.<name>.'
         type: string
@@ -25,6 +29,18 @@ on:
         description: 'Nodes whose system toplevel is built, one matrix row each: words, a JSON array, or auto (every configuration of `system`). Empty builds none.'
         type: string
         default: ''
+      node-max-parallel:
+        description: 'Node toplevel builds run at once. One nixosConfiguration evaluation peaks at 10-13 GB, and the private pool''s runners share one host (rio, 26 GB, no swap), where two at once trip earlyoom and the jobs die with exit 143. Raise it only for a pool whose hosts hold that many evaluations.'
+        type: number
+        default: 1
+      node-max-silent-time:
+        description: 'Seconds a node build may print nothing before nix kills it. A cache-missed onnxruntime test phase is silent for over an hour, past the 3600 s rio sets; 10800 stays inside the 6 h job limit. 0 keeps the daemon''s setting.'
+        type: number
+        default: 10800
+      node-eval-stack-kib:
+        description: 'Soft stack limit in KiB every node evaluation runs under, hard limit left unlimited: the limit the node''s reconciler evaluates its own toplevel under. sentinela runs with systemd''s default, 8192 KiB soft and unlimited hard; the private pool''s runners carry LimitSTACK=infinity, so without this a toplevel that overflows on the node evaluates green here (pleme-io/nix 4389f3bc, 2026-10-17). Empty evaluates under the runner''s own limit.'
+        type: string
+        default: '8192'
       node-attr-template:
         description: 'Attribute path built per node; NODE is the node name.'
         type: string
@@ -44,7 +60,7 @@ on:
       kijun-args:
         description: 'kijun arguments; {path} is the repo root, appended when absent.'
         type: string
-        default: 'check --json'
+        default: 'check --json --root {path}'
       kijun-fail-on-findings:
         description: 'Fail the lint job on kijun findings instead of reporting them.'
         type: boolean
@@ -73,9 +89,13 @@ on:
         description: 'Space-separated flake refs that must build against the new lock before it is published.'
         type: string
         default: ''
+      token-source:
+        description: 'Where every job takes its GitHub token (pleme-io/actions/github-token): app is the short-lived installation token the self-hosted runner host mints from the fleet App, absent on hosted runners, where public reads go anonymous; pat presents BOT_PAT; none presents nothing.'
+        type: string
+        default: 'app'
     secrets:
       BOT_PAT:
-        description: 'Org-scoped token: private flake inputs, and the flake-update push.'
+        description: 'Long-lived fallback token, presented only when token-source is pat.'
         required: false
       SUI_SIGNING_KEY:
         description: 'Signing key for cache-push.'
@@ -105,7 +125,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: pleme-io/actions/runner-policy@main
         with:
-          runner-labels: ${{ inputs.runner-labels }}
+          runner-labels: ${{ inputs.runner-labels }} ${{ inputs.eval-runner-labels }}
 
   plan:
     name: plan node matrix
@@ -117,13 +137,18 @@ jobs:
       node-count: ${{ steps.nodes.outputs.count }}
     steps:
       - uses: actions/checkout@v4
+      - id: token
+        uses: pleme-io/actions/github-token@main
+        with:
+          source: ${{ inputs.token-source }}
+          pat: ${{ secrets.BOT_PAT }}
       - id: nodes
         uses: pleme-io/actions/nix-node-matrix@main
         with:
           nodes: ${{ inputs.nodes }}
           attr-template: ${{ inputs.node-attr-template }}
           system: ${{ inputs.system }}
-          github-token: ${{ secrets.BOT_PAT }}
+          github-token: ${{ steps.token.outputs.token }}
 
   lint:
     name: lint
@@ -134,6 +159,11 @@ jobs:
       kijun-ran: ${{ steps.kijun.outputs.ran }}
     steps:
       - uses: actions/checkout@v4
+      - id: token
+        uses: pleme-io/actions/github-token@main
+        with:
+          source: ${{ inputs.token-source }}
+          pat: ${{ secrets.BOT_PAT }}
       - id: kijun
         if: inputs.kijun-ref != ''
         uses: pleme-io/actions/kijun-lint@main
@@ -141,29 +171,34 @@ jobs:
           flake-ref: ${{ inputs.kijun-ref }}
           args: ${{ inputs.kijun-args }}
           fail-on-findings: ${{ inputs.kijun-fail-on-findings }}
-          github-token: ${{ secrets.BOT_PAT }}
+          github-token: ${{ steps.token.outputs.token }}
       - if: inputs.canonical-check != ''
         uses: pleme-io/actions/nix-build@main
         with:
           flake-ref: .#checks.${{ inputs.system }}.${{ inputs.canonical-check }}
-          github-token: ${{ secrets.BOT_PAT }}
+          github-token: ${{ steps.token.outputs.token }}
 
   eval-checks:
     name: check ${{ matrix.check }}
     needs: policy
     if: inputs.flake-update == 'off' && inputs.eval-checks != '[]'
-    runs-on: ${{ fromJSON(inputs.runner-labels) }}
+    runs-on: ${{ fromJSON(inputs.eval-runner-labels != '' && inputs.eval-runner-labels || inputs.runner-labels) }}
     strategy:
       fail-fast: false
       matrix:
         check: ${{ fromJSON(inputs.eval-checks) }}
     steps:
       - uses: actions/checkout@v4
+      - id: token
+        uses: pleme-io/actions/github-token@main
+        with:
+          source: ${{ inputs.token-source }}
+          pat: ${{ secrets.BOT_PAT }}
       - id: build
         uses: pleme-io/actions/nix-build@main
         with:
           flake-ref: .#checks.${{ inputs.system }}.${{ matrix.check }}
-          github-token: ${{ secrets.BOT_PAT }}
+          github-token: ${{ steps.token.outputs.token }}
           cache-push: ${{ inputs.cache-push && inputs.cache-store-path != '' }}
           cache-store-path: ${{ inputs.cache-store-path }}
           cache-signing-key: ${{ secrets.SUI_SIGNING_KEY }}
@@ -178,7 +213,7 @@ jobs:
     name: known red ${{ matrix.check }} (advisory)
     needs: policy
     if: inputs.flake-update == 'off' && inputs.advisory-checks != '[]'
-    runs-on: ${{ fromJSON(inputs.runner-labels) }}
+    runs-on: ${{ fromJSON(inputs.eval-runner-labels != '' && inputs.eval-runner-labels || inputs.runner-labels) }}
     continue-on-error: true
     strategy:
       fail-fast: false
@@ -186,26 +221,63 @@ jobs:
         check: ${{ fromJSON(inputs.advisory-checks) }}
     steps:
       - uses: actions/checkout@v4
+      - id: token
+        uses: pleme-io/actions/github-token@main
+        with:
+          source: ${{ inputs.token-source }}
+          pat: ${{ secrets.BOT_PAT }}
       - uses: pleme-io/actions/nix-build@main
         with:
           flake-ref: .#checks.${{ inputs.system }}.${{ matrix.check }}
-          github-token: ${{ secrets.BOT_PAT }}
+          github-token: ${{ steps.token.outputs.token }}
+
+  node-eval:
+    name: node eval ${{ matrix.node }}
+    needs: plan
+    if: ${{ inputs.flake-update == 'off' && needs.plan.outputs.node-count != '0' && needs.plan.outputs.node-count != '' }}
+    runs-on: ${{ fromJSON(inputs.eval-runner-labels != '' && inputs.eval-runner-labels || inputs.runner-labels) }}
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ inputs.node-max-parallel }}
+      matrix: ${{ fromJSON(needs.plan.outputs.node-matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: token
+        uses: pleme-io/actions/github-token@main
+        with:
+          source: ${{ inputs.token-source }}
+          pat: ${{ secrets.BOT_PAT }}
+      - uses: pleme-io/actions/nix-build@main
+        with:
+          flake-ref: ${{ matrix.flake-ref }}
+          github-token: ${{ steps.token.outputs.token }}
+          eval-only: "true"
+          eval-stack-kib: ${{ inputs.node-eval-stack-kib }}
 
   nodes:
     name: node ${{ matrix.node }}
     needs: [plan, eval-checks]
     if: ${{ !failure() && !cancelled() && inputs.flake-update == 'off' && needs.plan.outputs.node-count != '0' && needs.plan.outputs.node-count != '' }}
-    runs-on: ${{ fromJSON(inputs.runner-labels) }}
+    runs-on: ${{ fromJSON(inputs.eval-runner-labels != '' && inputs.eval-runner-labels || inputs.runner-labels) }}
     strategy:
       fail-fast: false
+      max-parallel: ${{ inputs.node-max-parallel }}
       matrix: ${{ fromJSON(needs.plan.outputs.node-matrix) }}
     steps:
       - uses: actions/checkout@v4
+      - id: token
+        uses: pleme-io/actions/github-token@main
+        with:
+          source: ${{ inputs.token-source }}
+          pat: ${{ secrets.BOT_PAT }}
       - id: build
         uses: pleme-io/actions/nix-build@main
         with:
           flake-ref: ${{ matrix.flake-ref }}
-          github-token: ${{ secrets.BOT_PAT }}
+          github-token: ${{ steps.token.outputs.token }}
+          eval-first: "true"
+          eval-stack-kib: ${{ inputs.node-eval-stack-kib }}
+          max-silent-time: ${{ inputs.node-max-silent-time != 0 && inputs.node-max-silent-time || '' }}
           cache-push: ${{ inputs.cache-push && inputs.cache-store-path != '' }}
           cache-store-path: ${{ inputs.cache-store-path }}
           cache-signing-key: ${{ secrets.SUI_SIGNING_KEY }}
@@ -220,15 +292,20 @@ jobs:
     name: flake update (${{ inputs.flake-update }})
     needs: policy
     if: inputs.flake-update != 'off'
-    runs-on: ${{ fromJSON(inputs.runner-labels) }}
+    runs-on: ${{ fromJSON(inputs.eval-runner-labels != '' && inputs.eval-runner-labels || inputs.runner-labels) }}
     outputs:
       reason: ${{ steps.update.outputs.reason }}
       commit-sha: ${{ steps.update.outputs.commit-sha }}
     steps:
+      - id: token
+        uses: pleme-io/actions/github-token@main
+        with:
+          source: ${{ inputs.token-source }}
+          pat: ${{ secrets.BOT_PAT }}
       - id: update
         uses: pleme-io/actions/nix-flake-update@main
         with:
           mode: ${{ inputs.flake-update }}
           inputs-to-update: ${{ inputs.flake-update-inputs }}
           verify: ${{ inputs.flake-update-verify }}
-          github-token: ${{ secrets.BOT_PAT }}
+          github-token: ${{ steps.token.outputs.token }}

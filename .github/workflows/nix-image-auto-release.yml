@@ -79,6 +79,10 @@ on:
           content. See hardened-images/vex/README-scoping.md.
         type: string
         default: ""
+      scan-go-reachability:
+        description: "Judge the scan-before-push gate's Go findings with substrate's go-reachability primitive (pleme-io/actions/image-scan go-reachability), the same one the grype-scan app runs for an image with goReachability = true, so the two gates give one verdict per Go finding. False (default) keeps the gate unchanged."
+        type: boolean
+        default: false
       boot-check-cmd:
         description: "Correctness gate, run AFTER the CVE scan and BEFORE the push (a CVE-clean image that crashes at boot is worse than useless -- a hardened-images incident, 2026-07-17: mysql+rabbitmq both passed 0-CVE scans and neither could boot). Health command exec'd inside the started container via pleme-io/actions/container-boot-check (e.g. 'mysqladmin ping --silent', 'rabbitmq-diagnostics -q ping'). Empty (default) = no boot-check -- every existing caller keeps its current behavior unchanged; opt in per consumer, same shape as scan-before-push."
         type: string
@@ -178,12 +182,16 @@ on:
         description: "Flake package attr producing the image's `pkgs.closureInfo` output dir (a `store-paths` file), the cartorio SBOM source (e.g. 'vectorClosureInfo'). `nix build .#<attr>` here is a local cache hit off the just-built image closure. Required when cartorio-attest is true."
         type: string
         default: ""
+      token-source:
+        description: 'Where each job takes its GitHub token (pleme-io/actions/github-token): app (default) is the short-lived installation token the self-hosted runner host mints from the fleet App, absent on hosted runners, where GITHUB_TOKEN is presented instead; pat presents BOT_PAT; none presents nothing.'
+        type: string
+        default: 'app'
     secrets:
       BOT_PAT:
-        description: "Org PAT with write:packages, preferred by registry-login for OCI push to the org-shared ghcr.io/pleme-io namespace (a repo-scoped GITHUB_TOKEN 403s cross-namespace). Reaches public repos only on the Free plan; private repos fall through to GITHUB_TOKEN."
+        description: "Long-lived PAT, presented only when token-source is pat."
         required: false
       GHCR_TOKEN:
-        description: "Optional dedicated registry token. registry-login prefers BOT_PAT, then this, then GITHUB_TOKEN."
+        description: "Optional dedicated registry token. registry-login prefers the opt-in PAT (token-source pat), then this, then GITHUB_TOKEN."
         required: false
       ECR_TOKEN:
         description: >-
@@ -249,7 +257,7 @@ jobs:
     # (the job STARTS, so continue-on-error correctly absorbs any step
     # failure), public -> ubuntu-latest (free hosted minutes, unchanged). Same
     # idiom, same file, same rationale as `resolve`.
-    runs-on: ${{ github.event.repository.private && (vars.PRIVATE_BUILDER_RUNNER || 'ubuntu-latest') || 'ubuntu-latest' }}
+    runs-on: ${{ github.event.repository.private && (vars.PRIVATE_BUILDER_RUNNER || 'pleme-private') || 'ubuntu-latest' }}
     # report-only advisory (fail-on-violation:false); the no-cve-suppression
     # tatara-script has a not-yet-root-caused runtime error, so it must never
     # false-red a consumer's release. Remove once the script bug is fixed.
@@ -288,7 +296,7 @@ jobs:
     # failing before it ever reached the self-hosted pool this whole routing
     # exists to reach -- the routing job was itself the one still paying for
     # GitHub-hosted minutes.
-    runs-on: ${{ github.event.repository.private && (vars.PRIVATE_BUILDER_RUNNER || 'ubuntu-latest') || 'ubuntu-latest' }}
+    runs-on: ${{ github.event.repository.private && (vars.PRIVATE_BUILDER_RUNNER || 'pleme-private') || 'ubuntu-latest' }}
     outputs:
       runner: ${{ steps.resolve.outputs.runner }}
     steps:
@@ -296,7 +304,7 @@ jobs:
         id: resolve
         uses: pleme-io/actions/runner-resolve@main
         with:
-          default: ${{ github.event.repository.private && (vars.PRIVATE_BUILDER_RUNNER || 'ubuntu-latest') || 'ubuntu-24.04' }}
+          default: ${{ github.event.repository.private && (vars.PRIVATE_BUILDER_RUNNER || 'pleme-private') || 'ubuntu-24.04' }}
           override: ${{ inputs.runner }}
 
   publish:
@@ -334,6 +342,11 @@ jobs:
       run:
         working-directory: ${{ inputs.working-directory }}
     steps:
+      - id: token
+        uses: pleme-io/actions/github-token@main
+        with:
+          source: ${{ inputs.token-source }}
+          pat: ${{ secrets.BOT_PAT }}
       - uses: actions/checkout@v4
 
       # GitHub-hosted runners ship ~14GB usable disk; a large from-source Nix
@@ -437,7 +450,7 @@ jobs:
       # influences HOW bytes are fetched, never WHICH land. Same
       # byte-identical-for-non-adopters property the ECR_TOKEN input already has.
       #
-      # BOT_PAT rather than GITHUB_TOKEN: GITHUB_TOKEN is scoped to the CALLING
+      # The github-token step's token rather than GITHUB_TOKEN: GITHUB_TOKEN is scoped to the CALLING
       # repo and structurally cannot read a sibling private repo, which is the
       # whole failure being fixed. The name GH_TOKEN is used because the
       # consumer's `${GITHUB_TOKEN:-${GH_TOKEN:-}}` accepts either and GH_TOKEN
@@ -456,12 +469,12 @@ jobs:
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@main
         with:
-          github-token: ${{ secrets.BOT_PAT || secrets.GITHUB_TOKEN }}
+          github-token: ${{ steps.token.outputs.token || secrets.GITHUB_TOKEN }}
           determinate: false
           extra-conf: |
             sandbox = relaxed
-            ${{ (secrets.ECR_TOKEN || secrets.BOT_PAT) && 'extra-experimental-features = configurable-impure-env' || '' }}
-            ${{ (secrets.ECR_TOKEN || secrets.BOT_PAT) && format('impure-env = {0}{1}', secrets.ECR_TOKEN && format('ECR_TOKEN={0} ', secrets.ECR_TOKEN) || '', secrets.BOT_PAT && format('GH_TOKEN={0}', secrets.BOT_PAT) || '') || '' }}
+            ${{ (secrets.ECR_TOKEN || steps.token.outputs.token) && 'extra-experimental-features = configurable-impure-env' || '' }}
+            ${{ (secrets.ECR_TOKEN || steps.token.outputs.token) && format('impure-env = {0}{1}', secrets.ECR_TOKEN && format('ECR_TOKEN={0} ', secrets.ECR_TOKEN) || '', steps.token.outputs.token && format('GH_TOKEN={0}', steps.token.outputs.token) || '') || '' }}
             ${{ inputs.extraSubstituters && format('extra-substituters = {0}', inputs.extraSubstituters) || '' }}
             ${{ inputs.extraTrustedPublicKeys && format('extra-trusted-public-keys = {0}', inputs.extraTrustedPublicKeys) || '' }}
             ${{ inputs.requireSigs && format('require-sigs = {0}', inputs.requireSigs) || '' }}
@@ -542,6 +555,7 @@ jobs:
           ignore-unfixed: ${{ inputs.scan-ignore-unfixed }}
           ignore-file: ${{ inputs.scan-ignore-file }}
           vex: ${{ inputs.scan-vex-file }}
+          go-reachability: ${{ inputs.scan-go-reachability }}
 
       # Second-opinion CVE-database gate (grype) -- sibling to the trivy gate
       # above, same artifact (the app builds `images_.<name>` as an ordinary
@@ -648,7 +662,7 @@ jobs:
           health-cmd: ""
           env: ${{ inputs.boot-check-env }}
 
-      # Token-resolution overlay: BOT_PAT > GHCR_TOKEN > GITHUB_TOKEN lives
+      # Token-resolution overlay: PAT > GHCR_TOKEN > GITHUB_TOKEN lives
       # ONCE in the registry-login action (client: docker → ~/.docker/config.json,
       # the standard keychain forge image-release's DOCA push reads via doca's
       # `docker_config_credentials`). Said "skopeo/regctl" until 2026-08-01; both
@@ -660,7 +674,7 @@ jobs:
           registry: ${{ inputs.registry-host }}
           client: docker
           username: ${{ github.actor }}
-          bot-pat: ${{ secrets.BOT_PAT }}
+          bot-pat: ${{ steps.token.outputs.pat }}
           ghcr-token: ${{ secrets.GHCR_TOKEN }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
