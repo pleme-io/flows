@@ -24,7 +24,8 @@ end
 
 def flow?(flows, name)
   p = "#{flows}/.github/workflows/#{name}"
-  path_exists(p) and includes(read_file(p), "\n  workflow_call:")
+  path_exists(p) and
+    includes(read_file(p), join_lines(["", "  workflow_call:"]))
 end
 
 def repo_of(path)
@@ -105,8 +106,16 @@ end
 
 def scan_file(flows, write, path)
   old = read_file(path)
-  res = scan_lines(flows, path, repo_of(path), split(old, "\n"), 1, [], [])
-  new = join(first(rest(res)), "\n")
+  res = scan_lines(
+    flows,
+    path,
+    repo_of(path),
+    split(old, line_break),
+    1,
+    [],
+    []
+  )
+  new = join(first(rest(res)), line_break)
   if write and new != old
     write_file(path, new)
   end
@@ -119,18 +128,33 @@ def local(mode, flows, out, roots)
   rows = reduce((acc, f) -> append(acc, scan_file(flows, write, f)), [], files)
   write_file(
     out,
-    concat(join(cons("repo\tpath\tline\tflow\tref\tstatus", rows), "\n"), "\n")
+    concat(
+      join(cons("repo\tpath\tline\tflow\tref\tstatus", rows), line_break),
+      line_break
+    )
   )
   ok = size_of(filter((r) -> includes(r, "\tok"), rows))
   write_stdout(
-    "#{mode}: files scanned #{size_of(files)}, references #{size_of(rows)}, rewritable #{ok}; ledger #{out}\n"
+    unlines(
+      [
+        "#{mode}: files scanned #{size_of(files)}, references #{size_of(rows)}, rewritable #{ok}; ledger #{out}"
+      ]
+    )
   )
   if size_of(files) == 0
     exit_with(3)
   end
 end
 
-MESSAGE = "ci: call the reusable flows from pleme-io/flows\n\nEach uses: line names pleme-io/flows instead of pleme-io/substrate, at the\nsame ref. The two trees are byte-identical (substrate-parity). Rewritten by\nflows tools/cutover.b."
+MESSAGE = join_lines(
+  [
+    "ci: call the reusable flows from pleme-io/flows",
+    "",
+    "Each uses: line names pleme-io/flows instead of pleme-io/substrate, at the",
+    "same ref. The two trees are byte-identical (substrate-parity). Rewritten by",
+    "flows tools/cutover.b."
+  ]
+)
 
 def git(dir, args)
   exec_capture("git", "-C", dir, *args)
@@ -217,10 +241,13 @@ def push(flows, out, roots)
     (d) -> push_repo(flows, d, filter((f) -> repo_dir(f) == d, calls)),
     dirs
   )
-  write_file(out, concat(join(cons("repo\tresult", rows), "\n"), "\n"))
+  write_file(
+    out,
+    concat(join(cons("repo\tresult", rows), line_break), line_break)
+  )
   pushed = size_of(filter((r) -> includes(r, "\tpushed"), rows))
   write_stdout(
-    "push: repos #{size_of(dirs)}, pushed #{pushed}; ledger #{out}\n"
+    unlines(["push: repos #{size_of(dirs)}, pushed #{pushed}; ledger #{out}"])
   )
 end
 
@@ -247,7 +274,7 @@ def search_page(name, page)
   if status_of(r) != 0
     raise("search for #{name} page #{page} failed: blind, not empty")
   end
-  filter((l) -> trim(l) != "", split(stdout_of(r), "\n"))
+  filter((l) -> trim(l) != "", split(stdout_of(r), line_break))
 end
 
 def search_all(name, page, acc)
@@ -272,10 +299,14 @@ def search(flows, out)
   rows = reduce((acc, n) -> append(acc, search_all(n, 1, [])), [], names)
   write_file(
     out,
-    concat(join(cons("flow\ttotal\trepo\tpath", rows), "\n"), "\n")
+    concat(join(cons("flow\ttotal\trepo\tpath", rows), line_break), line_break)
   )
   write_stdout(
-    "search: flows queried #{size_of(names)}, files found #{size_of(rows)}; ledger #{out}\n"
+    unlines(
+      [
+        "search: flows queried #{size_of(names)}, files found #{size_of(rows)}; ledger #{out}"
+      ]
+    )
   )
 end
 
