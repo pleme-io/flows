@@ -28,6 +28,7 @@
     (list "nix-fleet.yml" "${{ fromJSON(inputs.runner-labels) }}" "a label array")
     (list "nix-fleet.yml" "${{ fromJSON(inputs.eval-runner-labels != '' && inputs.eval-runner-labels || inputs.runner-labels) }}" "a label array")
     (list "super-cache-ci-build.yml" "${{ fromJSON(inputs.runner) }}" "a label array")
+    (list "blue-project.yml" "${{ fromJSON(inputs.runner-labels) }}" "a label array")
     (list "super-cache-ci-build-matrix.yml" "${{ inputs.discover-runner != '' && inputs.discover-runner || (github.event.repository.private && (vars.PRIVATE_BUILDER_RUNNER || 'pleme-private') || 'ubuntu-latest') }}" "the discover job takes its own runner, then the route")
     (list "hardened-image-pipeline.yml" "${{ fromJSON(inputs.spec).runner }}" "the runner comes from the image spec")))
 
@@ -122,6 +123,30 @@
           ((same-set? (second (car r)) (declared-inputs ls)) 0)
           (else (fail-line (string-append "CATALOG " n ": row :inputs (" (string-join " " (second (car r))) ") differ from the declared inputs (" (string-join " " (declared-inputs ls)) ")"))))))
 
+(define (concurrency-group ls)
+  (let ((gs (filter (fn (l) (string-starts-with? l "  group: ")) (block ls "concurrency:" 0))))
+    (if (null? gs) "" (string-trim (re-replace "^  group: " (car gs) "")))))
+
+(define (callees ls)
+  (map (fn (l) (re-replace "^\\s+uses: \\./\\.github/workflows/([A-Za-z0-9._-]+\\.yml).*$" l "$1"))
+       (filter (fn (l) (re-match? "^\\s+uses: \\./\\.github/workflows/[A-Za-z0-9._-]+\\.yml" l)) ls)))
+
+(define (flow-lines n)
+  (let ((p (string-append FLOWS "/" n)))
+    (if (path-exists? p) (lines-of p) (list))))
+
+(define (reachable todo seen)
+  (cond ((null? todo) seen)
+        ((member? (car todo) seen) (reachable (cdr todo) seen))
+        (else (reachable (append (cdr todo) (callees (flow-lines (car todo)))) (cons (car todo) seen)))))
+
+(define (check-deadlock n ls)
+  (let ((g (concurrency-group ls)))
+    (if (equal? g "")
+        0
+        (sum (map (fn (c) (fail-line (string-append "DEADLK  " n ": concurrency group " g " is also the group of " c ", which it calls; the callee waits on its caller and GitHub cancels it")))
+                  (filter (fn (c) (equal? (concurrency-group (flow-lines c)) g)) (reachable (callees ls) (list))))))))
+
 (define flows (filter (fn (p) (not (native? (path-basename p)))) (glob (string-append FLOWS "/*.yml"))))
 
 (when (< (length flows) MIN-FLOWS)
@@ -131,7 +156,7 @@
 (define (check-flow p)
   (let ((n (path-basename p)) (ls (lines-of p)))
     (+ (check-call n ls) (check-name n ls) (check-summary n ls) (check-routes n ls) (check-runner-input n ls)
-       (check-self-refs n ls) (check-permissions n ls) (check-catalog n ls))))
+       (check-self-refs n ls) (check-permissions n ls) (check-catalog n ls) (check-deadlock n ls))))
 
 (define names (map path-basename flows))
 (define orphans (filter (fn (r) (not (member? (car r) names))) rows))

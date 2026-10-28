@@ -203,6 +203,10 @@ on:
         description: "sui super-cache endpoint to PUSH the just-built imageAttr's store path to (e.g. http://sui.<build-namespace>.svc), via pleme-io/actions/super-cache-save. The write half of extraSubstituters above — without this, every caller that reads from sui never contributes back, so a from-source overlay pays a full cold rebuild on every single run forever, even after a successful build (mirrors nix-image-auto-release.yml's own input of the same name, added there first — pangea-operator's ci.yml/release.yml were the first callers found still missing it). Runs right after the local build and before the CVE gate, since the cache write is a pure content-addressed store-path push independent of what the scan later decides. Best-effort (never fails the job on a push error — see super-cache-save's own README). Empty (default) = no push, zero blast radius for existing consumers."
         type: string
         default: ""
+      publish:
+        description: "Push the built image to the registry. False builds, saves to the super-cache when configured and runs the CVE gate, but skips the package-visibility gate, the registry login and the push: the image ships through nix only. True (default) changes nothing for any existing caller."
+        type: boolean
+        default: true
       scanBeforePush:
         description: "Zero-tolerance CVE gate (theory/SECURITY-LAYER.md §8's 'build-time pre-publish CVE gate'; same shape as nix-image-auto-release.yml's own scan-before-push): scan the LOCAL image tarball built above with pleme-io/actions/image-scan (trivy --input, no registry round-trip -- the image has never been pushed anywhere at this point) and only run the push step if the scan is clean. False (default) preserves every existing caller's exact atomic build+push behavior unchanged -- opt in per consumer."
         type: boolean
@@ -233,6 +237,12 @@ on:
         required: false
       GHCR_TOKEN:
         description: "Optional dedicated registry token. registry-login prefers the opt-in PAT (token-source pat), then this, then GITHUB_TOKEN."
+        required: false
+      PUBLISH_APP_ID:
+        description: "Optional pleme-publish App ID. With PUBLISH_APP_KEY, a job on a hosted runner mints its own App token (packages write), which registry-login prefers over every other rung."
+        required: false
+      PUBLISH_APP_KEY:
+        description: "Optional pleme-publish App private key; used only with PUBLISH_APP_ID."
         required: false
       ECR_TOKEN:
         description: >-
@@ -298,6 +308,9 @@ jobs:
         with:
           source: ${{ inputs.token-source }}
           pat: ${{ secrets.BOT_PAT }}
+          app-id: ${{ secrets.PUBLISH_APP_ID }}
+          app-private-key: ${{ secrets.PUBLISH_APP_KEY }}
+          app-permission-packages: write
       # BEFORE the checkout and everything expensive after it: refuse a publish
       # that would bill the org's ONE shared storage allowance. This file
       # already treats repository visibility as load-bearing -- resolve-runner's
@@ -305,6 +318,7 @@ jobs:
       # This makes it load-bearing for the PACKAGE too, which is the half that
       # was missing when the allowance ran out.
       - uses: pleme-io/actions/package-visibility-gate@main
+        if: inputs.publish
         with:
           what: "container image"
           allow-private: ${{ inputs.allowPrivatePackage }}
@@ -831,11 +845,13 @@ jobs:
       # ONCE in the registry-login action (client: docker → ~/.docker/config.json,
       # which the doca push step below reads the resolved token back out of).
       - name: Login to registry
+        if: inputs.publish
         uses: pleme-io/actions/registry-login@main
         with:
           registry: ${{ inputs.registry }}
           client: docker
           username: ${{ github.actor }}
+          app-token: ${{ steps.token.outputs.app-token }}
           bot-pat: ${{ steps.token.outputs.pat }}
           ghcr-token: ${{ secrets.GHCR_TOKEN }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -853,6 +869,7 @@ jobs:
       # `substrate/.github/workflows/doca-selftest.yml`; this step mirrors
       # that exact invocation.
       - name: Push image (doca native backend)
+        if: inputs.publish
         env:
           REGISTRY: ${{ inputs.registry }}
           IMAGE:    ${{ inputs.imageName || github.repository }}
