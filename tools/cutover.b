@@ -1,10 +1,10 @@
-use("moji", [:after_first, :before_first, :includes, :starts_with, :trim])
-use("retsu", [:contains, :first, :is_empty, :rest])
-use("shisutemu", [:status_of, :stdout_of])
+use("moji", %i[after_first before_first includes starts_with trim])
+use("retsu", %i[contains first is_empty rest])
+use("shisutemu", %i[status_of stdout_of])
 
 OLD = "pleme-io/substrate/.github/workflows/"
 NEW = "pleme-io/flows/.github/workflows/"
-SELF = ["substrate", "flows"]
+SELF = %w[substrate flows]
 
 def call_line?(line)
   t = trim(line)
@@ -173,16 +173,15 @@ def repo_dir(path)
 end
 
 def ready(dir)
-  clean = trim(stdout_of(git(dir, ["status", "--porcelain"]))) == ""
-  on_main = trim(stdout_of(git(dir, ["rev-parse", "--abbrev-ref", "HEAD"]))) ==
-    "main"
+  clean = trim(stdout_of(git(dir, %w[status --porcelain]))) == ""
+  on_main = trim(stdout_of(git(dir, %w[rev-parse --abbrev-ref HEAD]))) == "main"
   if not clean
     "dirty"
   elsif not on_main
     "not-on-main"
-  elsif not git_ok(dir, ["fetch", "-q", "origin"])
+  elsif not git_ok(dir, %w[fetch -q origin])
     "fetch-failed"
-  elsif not git_ok(dir, ["merge", "--ff-only", "-q", "origin/main"])
+  elsif not git_ok(dir, %w[merge --ff-only -q origin/main])
     "not-fast-forward"
   else
     "ready"
@@ -210,12 +209,12 @@ def push_repo(flows, dir, files)
       "#{dir}\tnothing-to-rewrite"
     elsif not git_ok(
       dir,
-      append(["add", "--"], map((f) -> replace(f, "#{dir}/", ""), changed))
+      append(%w[add --], map((f) -> replace(f, "#{dir}/", ""), changed))
     )
       "#{dir}\tadd-failed"
     elsif not git_ok(dir, ["commit", "-q", "-m", MESSAGE])
       "#{dir}\tcommit-failed"
-    elsif not git_ok(dir, ["push", "-q", "origin", "main"])
+    elsif not git_ok(dir, %w[push -q origin main])
       "#{dir}\tpush-failed"
     else
       "#{dir}\tpushed #{size_of(changed)} files #{size_of(filter((x) -> includes(x, "\tok"), rows))} references"
@@ -314,9 +313,9 @@ test "a substrate call is rewritten to flows when flows holds the flow"
   assert call_line?("    uses: pleme-io/substrate/.github/workflows/x.yml@main")
   assert not call_line?("# uses: pleme-io/substrate/.github/workflows/x.yml@main")
   assert target("    uses: pleme-io/substrate/.github/workflows/x.yml@v1 # pin") ==
-    ["x.yml", "v1"]
+    %w[x.yml v1]
   assert target("    uses: \"pleme-io/substrate/.github/workflows/x.yml@main\"") ==
-    ["x.yml", "main"]
+    %w[x.yml main]
 end
 
 test "the repo of a workflow file is the directory above .github"
