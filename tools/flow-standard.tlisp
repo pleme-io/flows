@@ -29,6 +29,8 @@
     (list "nix-fleet.yml" "${{ fromJSON(inputs.eval-runner-labels != '' && inputs.eval-runner-labels || inputs.runner-labels) }}" "a label array")
     (list "super-cache-ci-build.yml" "${{ fromJSON(inputs.runner) }}" "a label array")
     (list "blue-project.yml" "${{ fromJSON(inputs.runner-labels) }}" "a label array")
+    (list "engenho-delivery.yml" "${{ fromJSON(inputs.first-runner-labels) }}" "a label array: the first stage builds on its own node")
+    (list "engenho-delivery.yml" "${{ fromJSON(inputs.second-runner-labels) }}" "a label array: the second stage builds on its own node")
     (list "super-cache-ci-build-matrix.yml" "${{ inputs.discover-runner != '' && inputs.discover-runner || (github.event.repository.private && (vars.PRIVATE_BUILDER_RUNNER || 'pleme-private') || 'ubuntu-latest') }}" "the discover job takes its own runner, then the route")
     (list "hardened-image-pipeline.yml" "${{ fromJSON(inputs.spec).runner }}" "the runner comes from the image spec")))
 
