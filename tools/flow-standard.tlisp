@@ -23,6 +23,7 @@
     (list "esteira-rio-release.yml" "${{ inputs.runner }}" "platform pin: rio")
     (list "mac-autobump-release.yml" "${{ inputs.runner }}" "platform pin: rio")
     (list "ios-game-ci.yml" "${{ inputs.runner }}" "platform pin: macos")
+    (list "blue-service-release.yml" "${{ inputs.runner-labels != '' && fromJSON(inputs.runner-labels) || (github.event.repository.private && (vars.PRIVATE_BUILDER_RUNNER || 'pleme-private') || 'ubuntu-latest') }}" "a label array, then the route")
     (list "gem-auto-bump.yml" "${{ inputs.runner-labels != '' && fromJSON(inputs.runner-labels) || (github.event.repository.private && (vars.PRIVATE_BUILDER_RUNNER || 'pleme-private') || 'ubuntu-latest') }}" "a label array, then the route")
     (list "gem-ci.yml" "${{ inputs.runner-labels != '' && fromJSON(inputs.runner-labels) || (github.event.repository.private && (vars.PRIVATE_BUILDER_RUNNER || 'pleme-private') || 'ubuntu-latest') }}" "a label array, then the route")
     (list "nix-fleet.yml" "${{ fromJSON(inputs.runner-labels) }}" "a label array")
