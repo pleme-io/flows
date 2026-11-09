@@ -28,7 +28,7 @@
 #       with: { svc: akeyless-auth, arch: amd64 }
 #       secrets: inherit
 #
-# ── TIER-HONEST (never round up) ─────────────────────────────────────
+# ── TIER-HONEST (never round up) ─────────
 # The verbs pinned @main resolve today (the suite lives on pleme-io/actions
 # main); they promote to @v1 when AUTO-RELEASE cuts the suite into the v1 tag
 # (refs/tags/v1 currently lags the suite — pin @main until then).

@@ -30,7 +30,7 @@
 #       with: { arches: "amd64", image-base: "dockerImage" }
 #       secrets: inherit
 #
-# ── TIER-HONEST (never round up) ─────────────────────────────────────
+# ── TIER-HONEST (never round up) ─────────
 # * The fan is a REAL GHA matrix over the flake's real attrs (build-matrix is
 #   SHIPPABLE-NOW — honest per-service arch discovery, never a hardcoded pair).
 # * "wall-clock ≈ slowest-service, not the sum" is the DESIGN result of the
