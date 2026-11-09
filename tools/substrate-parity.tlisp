@@ -33,7 +33,14 @@
 
 ;; Where the calling workflow mounts the substrate checkout.
 (define SUBSTRATE-DIR "substrate/.github/workflows")
+(define SUBSTRATE-CATALOG "substrate/catalog/workflows.lisp")
 (define LOCAL-DIR ".github/workflows")
+(define WRITE (equal? (env-get "MODE" "check") "write"))
+
+(define (sync-from-substrate theirs mine label)
+  (write-file mine (read-file theirs))
+  (print-line (string-append "SYNCED  " label " — copied from substrate"))
+  0)
 
 ;; A floor, not a count assertion. 91 flows and 37 case tables moved on
 ;; 2026-08-19; the floor sits well below that and far above zero because a
@@ -68,8 +75,9 @@
         (print-line (string-append "EXTRA   " n " — present here, absent in substrate"))
         1)
       ((not (equal? (read-file mine) (read-file theirs)))
-        (print-line (string-append "DIFFERS " n))
-        1)
+        (if WRITE
+          (sync-from-substrate theirs mine n)
+          (begin (print-line (string-append "DIFFERS " n)) 1)))
       (else 0))))
 
 (define local-files
@@ -104,26 +112,42 @@
 (define (declares-workflow-call? p)
   (string-contains? (read-file p) "\n  workflow_call:"))
 
+(define substrate-files (glob (string-append SUBSTRATE-DIR "/*.yml")))
+
+(when (< (length substrate-files) MIN-FILES)
+  (print-line
+    (string-append
+      "FATAL: found " (string-format "{}" (length substrate-files))
+      " substrate flows, expected at least " (string-format "{}" MIN-FILES)
+      " — the substrate scan read nothing, so no MISSING verdict is possible"))
+  (exit 3))
+
 (define missing
   (filter
     (fn (p)
       (and (declares-workflow-call? p)
            (not (path-exists? (string-append LOCAL-DIR "/" (path-basename p))))))
-    (glob (string-append SUBSTRATE-DIR "/*.yml"))))
+    substrate-files))
 
-(reduce
-  (fn (acc p)
-    (print-line
-      (string-append "MISSING " (path-basename p) " — workflow_call flow not mirrored here"))
-    acc)
-  0 missing)
+(define unsynced
+  (reduce
+    (fn (acc p)
+      (if WRITE
+        (+ acc (sync-from-substrate p (string-append LOCAL-DIR "/" (path-basename p)) (path-basename p)))
+        (begin
+          (print-line
+            (string-append "MISSING " (path-basename p) " — workflow_call flow not mirrored here"))
+          (+ acc 1))))
+    0 missing))
 
 (define catalog-drift
   (cond
-    ((not (path-exists? "substrate/catalog/workflows.lisp"))
+    ((not (path-exists? SUBSTRATE-CATALOG))
       (print-line "DIFFERS catalog/workflows.lisp — absent in substrate")
       1)
-    ((not (equal? (read-file "catalog/workflows.lisp") (read-file "substrate/catalog/workflows.lisp")))
+    ((and WRITE (not (equal? (read-file "catalog/workflows.lisp") (read-file SUBSTRATE-CATALOG))))
+      (sync-from-substrate SUBSTRATE-CATALOG "catalog/workflows.lisp" "catalog/workflows.lisp"))
+    ((not (equal? (read-file "catalog/workflows.lisp") (read-file SUBSTRATE-CATALOG)))
       (print-line "DIFFERS catalog/workflows.lisp — the catalog source is here, substrate holds its mirror")
       1)
     (else 0)))
@@ -132,7 +156,7 @@
   (string-append
     "result: " (string-format "{}" (- (length local-files) drift))
     "/" (string-format "{}" (length local-files)) " identical, "
-    (string-format "{}" (length missing)) " missing, catalog "
+    (string-format "{}" unsynced) " missing, catalog "
     (if (= catalog-drift 0) "identical" "differs")))
 
-(exit (if (> (+ drift catalog-drift (length missing)) 0) 1 0))
+(exit (if (> (+ drift catalog-drift unsynced) 0) 1 0))

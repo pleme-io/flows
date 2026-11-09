@@ -92,6 +92,10 @@ on:
         description: "Runner label. Empty routes by caller visibility: a private caller to vars.PRIVATE_BUILDER_RUNNER or pleme-private, a public caller to ubuntu-latest."
         type: string
         default: ""
+      test-runner:
+        description: "Runner label for the cargo-test job alone. Empty uses `runner`. A self-hosted pool sized for nix builds (they run in nix-daemon) may not hold a cargo test, which compiles in the runner's own cgroup."
+        type: string
+        default: ""
       flake-args:
         description: >-
           Extra arguments appended to `nix flake check`. Empty by default, so
@@ -177,6 +181,18 @@ on:
         description: 'Where each job takes its GitHub token (pleme-io/actions/github-token): app (default) is the short-lived installation token the self-hosted runner host mints from the fleet App, absent on hosted runners, where GITHUB_TOKEN is presented instead; pat presents BOT_PAT; none presents nothing.'
         type: string
         default: 'app'
+      cargo-test:
+        description: 'Run the cargo-test job. false skips it, for a caller that accepts other evidence of the suite, such as a proof of a local run of the same tree.'
+        type: boolean
+        default: true
+      closure-artifact:
+        description: 'Name of an artifact of this run holding a nix binary cache (file://) and an out-path file, imported into the store before flake-check builds, so a closure another job built is a store hit. Empty imports nothing; a missing artifact or a refused import leaves the build as it was.'
+        type: string
+        default: ''
+      flake-check-shards:
+        description: 'Parallel flake-check jobs. 1 runs one `nix flake check`, as before. N > 1 lists the flake''s checks for the runner''s system, deals them round-robin into N groups and builds each group in its own job (nix-flake-check `only`), each importing closure-artifact; the flake-checks gate and build-targets run in the first. On a hosted runner the jobs run at once, so the check set takes about its longest group rather than its sum: blue''s 266 checks took 47 min in one job (land run 42506606488).'
+        type: number
+        default: 1
 
 jobs:
   # ── Runner resolution — the leg this workflow never had ────────────────
@@ -212,9 +228,39 @@ jobs:
           override: ${{ inputs.runner }}
           public-runner-default: "ubuntu-latest"
 
-  flake-check:
+  plan-flake-check:
+    name: plan flake-check shards
+    if: ${{ inputs.flake-check-shards > 1 }}
     needs: resolve-runner
     runs-on: ${{ needs.resolve-runner.outputs.runner }}
+    outputs:
+      shards: ${{ steps.plan.outputs.shards }}
+    steps:
+      - id: token
+        uses: pleme-io/actions/github-token@main
+        with:
+          source: ${{ inputs.token-source }}
+          pat: ${{ secrets.BOT_PAT }}
+      - uses: actions/checkout@v4
+      - uses: pleme-io/actions/nix-setup@main
+        with:
+          github-token: ${{ steps.token.outputs.token || secrets.GITHUB_TOKEN }}
+      - id: plan
+        env:
+          SHARDS: ${{ inputs.flake-check-shards }}
+        run: |
+          system=$(nix eval --raw --impure --expr builtins.currentSystem)
+          nix eval --json ".#checks.$system" --apply builtins.attrNames | jq -c --argjson n "$SHARDS" --arg s "$system" '[range($n) as $i | {index: ($i + 1), only: ([to_entries[] | select(.key % $n == $i) | ".#checks.\($s).\(.value)"] | join(" "))}] | "shards=\(tojson)"' -r >> "$GITHUB_OUTPUT"
+
+  flake-check:
+    name: ${{ inputs.flake-check-shards > 1 && format('flake-check {0}/{1}', matrix.shard.index, inputs.flake-check-shards) || 'flake-check' }}
+    needs: [resolve-runner, plan-flake-check]
+    if: ${{ !cancelled() && needs.resolve-runner.result == 'success' && needs.plan-flake-check.result != 'failure' }}
+    runs-on: ${{ needs.resolve-runner.outputs.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.plan-flake-check.outputs.shards || '[{"index":1,"only":""}]') }}
     steps:
       - id: token
         uses: pleme-io/actions/github-token@main
@@ -259,9 +305,27 @@ jobs:
           bot-pat: ${{ steps.token.outputs.token }}
           scope: system
 
+      - name: Install Nix to import ${{ inputs.closure-artifact }}
+        if: inputs.closure-artifact != ''
+        uses: pleme-io/actions/nix-setup@main
+        with:
+          github-token: ${{ steps.token.outputs.token || secrets.GITHUB_TOKEN }}
+      - name: Download ${{ inputs.closure-artifact }}
+        if: inputs.closure-artifact != ''
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.closure-artifact }}
+          path: ${{ runner.temp }}/closure
+      - name: Import ${{ inputs.closure-artifact }} into the store
+        if: inputs.closure-artifact != ''
+        continue-on-error: true
+        run: nix copy --from "file://$RUNNER_TEMP/closure" --no-check-sigs "$(cat "$RUNNER_TEMP/closure/out-path")"
+
       - uses: pleme-io/actions/nix-flake-check@main
         with:
           flake-args: ${{ inputs.flake-args }}
+          only: ${{ matrix.shard.only }}
           # Without this, a repo with a PRIVATE pleme-io git-crate dep fails
           # here on an HTTP 404 from api.github.com — nix's own GitHub fetcher
           # running anonymous. The sibling `cargo-test` leg never had this
@@ -281,7 +345,7 @@ jobs:
           github-token: ${{ steps.token.outputs.token || secrets.GITHUB_TOKEN }}
 
       - name: nix build ${{ inputs.build-targets }}
-        if: ${{ inputs.build-targets != '' }}
+        if: ${{ inputs.build-targets != '' && matrix.shard.index == 1 }}
         env:
           # Same private-dep credential path as the flake-check step above:
           # nix's GitHub fetcher is separate from cargo's git, and runs
@@ -302,6 +366,7 @@ jobs:
       # `checks` absent entirely is handled by `or {}` in the caller here,
       # so the gate never has to classify a missing-attribute error.
       - name: Gate -- the flake must expose at least one check
+        if: ${{ matrix.shard.index == 1 }}
         run: >-
           nix eval --impure --raw --expr
           'import (builtins.getFlake "github:pleme-io/substrate").flakeChecksGatePath {
@@ -310,6 +375,7 @@ jobs:
            }'
 
   cargo-test:
+    if: ${{ inputs.cargo-test }}
     # Composes substrate's existing devShell test workflow rather than
     # re-inlining `nix develop -c cargo test` here (Operating Principle #1:
     # extend the near-miss, never re-implement it). That workflow already
@@ -322,5 +388,5 @@ jobs:
       fmt-check: ${{ inputs.fmt-check }}
       devshell-args: ${{ inputs.devshell-args }}
       token-source: ${{ inputs.token-source }}
-      runner: ${{ inputs.runner }}
+      runner: ${{ inputs.test-runner != '' && inputs.test-runner || inputs.runner }}
     secrets: inherit
