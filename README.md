@@ -34,9 +34,6 @@ logic; every rung above is a call with values.
 | 3 | Extend an action | one input + its branch in `run.tlisp` | `pleme-io/actions` |
 | 4 | Author an action | `action.yml` + `run.tlisp` + `run.test.tlisp` | `pleme-io/actions` |
 
-Canonical: [`theory/PIPELINE-DELIVERY.md`](https://github.com/pleme-io/theory/blob/main/PIPELINE-DELIVERY.md).
-What a flow may *contain*: [`CONSTRUCTIVE-ACTIONS.md`](https://github.com/pleme-io/theory/blob/main/CONSTRUCTIVE-ACTIONS.md) §0.
-
 ## The general family — read these eleven first
 
 Each is a dispatcher taking one `target:` input, so adopting a class of repo is

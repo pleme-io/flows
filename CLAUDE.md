@@ -1,6 +1,6 @@
 # flows
 
-> **★★★ CSE / Knowable Construction.** This repo operates under **Constructive Substrate Engineering** — canonical specification at [`pleme-io/theory/CONSTRUCTIVE-SUBSTRATE-ENGINEERING.md`](https://github.com/pleme-io/theory/blob/main/CONSTRUCTIVE-SUBSTRATE-ENGINEERING.md). The Compounding Directive (operational rules: solve once, load-bearing fixes only, idiom-first, models stay current, direction beats velocity) is in the org-level pleme-io/CLAUDE.md ★★★ section. Read both before non-trivial changes.
+> **★★★ CSE / Knowable Construction.** This repo operates under **Constructive Substrate Engineering**. The Compounding Directive (operational rules: solve once, load-bearing fixes only, idiom-first, models stay current, direction beats velocity) is in the org-level pleme-io/CLAUDE.md ★★★ section. Read it before non-trivial changes.
 
 The fleet's reusable `workflow_call` catalog, sibling to `pleme-io/actions`
 (counts: README, measured by `tools/flow-standard.tlisp`). Read
@@ -25,9 +25,7 @@ as a forwarding shim — see README § Status. Do not propose one.
 A workflow is a **call with values**. A `run:` block holding a comparison, a
 loop, or an error message is a capability in the wrong file: it belongs in a
 `pleme-io/actions` action, where one fix reaches every caller instead of being
-fixed once per copy. Canonical:
-[`CONSTRUCTIVE-ACTIONS.md`](https://github.com/pleme-io/theory/blob/main/CONSTRUCTIVE-ACTIONS.md) §0
-and [`PIPELINE-DELIVERY.md`](https://github.com/pleme-io/theory/blob/main/PIPELINE-DELIVERY.md).
+fixed once per copy.
 
 This repo holds itself to it: `substrate-parity.yml` carries no `run:` — its
 comparison is [`tools/substrate-parity.tlisp`](./tools/substrate-parity.tlisp),
