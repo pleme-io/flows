@@ -11,7 +11,7 @@
 #         version: ""                       # optional; parsed from Chart.yaml
 #         libChartDir: ""                   # optional, for file:// deps (e.g. pleme-lib)
 #       secrets:
-#         GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+#         BOT_PAT: ${{ secrets.BOT_PAT }}   # only if token-source is pat
 #
 # Strategy:
 #   - Prefers `forge helm release` (lint + package + push as one transaction).
@@ -60,14 +60,8 @@ on:
         type: string
         default: 'app'
     secrets:
-      GHCR_TOKEN:
-        description: "Token with write:packages on the target registry. Falls back to GITHUB_TOKEN."
-        required: false
       BOT_PAT:
         description: "Long-lived PAT for the Nix installer's GitHub API calls, presented only when token-source is pat."
-        required: false
-      BOT_PAT_PUSH:
-        description: "Optional classic org PAT with write:packages, the registry-login ladder's rung below the App token. The App token (source: app, a self-hosted runner) outranks it."
         required: false
 
 jobs:

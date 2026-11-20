@@ -75,7 +75,7 @@
 (defworkflow rust-auto-release
   :file      "rust-auto-release.yml"
   :pattern   rust
-  :inputs    (bump-type source-paths add-paths rename-prefix ride-budget-minutes no-verify runner require-tests require-tests-waiver test-granularity test-devshell test-args token-source)
+  :inputs    (bump-type source-paths add-paths release-ref-mode rename-prefix ride-budget-minutes no-verify runner require-tests require-tests-waiver test-granularity test-devshell test-args token-source)
   :outputs   ()
   :secrets   (CRATES_API_TOKEN BOT_PAT)
   :consumers 51)
@@ -331,6 +331,14 @@
   :secrets   ()
   :consumers 2)
 
+(defworkflow crypto-rng-gate
+  :file      "crypto-rng-gate.yml"
+  :pattern   gate
+  :inputs    (clippy-args runner)
+  :outputs   ()
+  :secrets   ()
+  :consumers 1)
+
 (defworkflow helm-chart-release
   :file      "helm-chart-release.yml"
   :pattern   helm-chart
@@ -536,8 +544,16 @@
   :pattern   helm-chart
   :inputs    (chartPath registry version libChartDir libChartName runner token-source)
   :outputs   ()
-  :secrets   (GHCR_TOKEN BOT_PAT)
+  :secrets   (BOT_PAT)
   :consumers 0)
+
+(defworkflow charts-publish
+  :file      "charts-publish.yml"
+  :pattern   helm-chart
+  :inputs    (chartsPath registry runner token-source)
+  :outputs   ()
+  :secrets   ()
+  :consumers 1)
 
 (defworkflow ios-game-ci
   :file      "ios-game-ci.yml"
@@ -820,3 +836,11 @@
   :outputs   (released version tag)
   :secrets   (BOT_PAT)
   :consumers 1)
+
+(defworkflow runner-resolve
+  :file      "runner-resolve.yml"
+  :pattern   other
+  :inputs    (runner public-runner-default overflow-runner overflow-threshold pressure)
+  :outputs   (runner provenance overflow)
+  :secrets   ()
+  :consumers 8)
