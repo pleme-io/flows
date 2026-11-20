@@ -33,7 +33,8 @@
     (list "engenho-delivery.yml" "${{ fromJSON(inputs.first-runner-labels) }}" "a label array: the first stage builds on its own node")
     (list "engenho-delivery.yml" "${{ fromJSON(inputs.second-runner-labels) }}" "a label array: the second stage builds on its own node")
     (list "super-cache-ci-build-matrix.yml" "${{ inputs.discover-runner != '' && inputs.discover-runner || (github.event.repository.private && (vars.PRIVATE_BUILDER_RUNNER || 'pleme-private') || 'ubuntu-latest') }}" "the discover job takes its own runner, then the route")
-    (list "hardened-image-pipeline.yml" "${{ fromJSON(inputs.spec).runner }}" "the runner comes from the image spec")))
+    (list "hardened-image-pipeline.yml" "${{ fromJSON(inputs.spec).runner }}" "the runner comes from the image spec")
+    (list "runner-resolve.yml" ">-" "the resolver itself: its own output routes every other job, so it cannot route by a needs output")))
 
 (define PERMISSIONS-LEDGER-FILE "tools/permissions-ledger.txt")
 
