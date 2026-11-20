@@ -61,6 +61,9 @@ on:
       BOT_PAT:
         description: "Long-lived PAT for the Nix installer's GitHub API calls, presented only when token-source is pat."
         required: false
+      BOT_PAT_PUSH:
+        description: "Optional classic org PAT with write:packages, the registry-login ladder's rung below the App token. The App token (source: app, a self-hosted runner) outranks it."
+        required: false
 
 jobs:
   publish:
@@ -82,15 +85,22 @@ jobs:
         with:
           github-token: ${{ steps.token.outputs.token || secrets.GITHUB_TOKEN }}
       - name: Registry login
-        env:
-          REGISTRY: ${{ inputs.registry }}
-          TOKEN: ${{ secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN || github.token }}
-        run: |
-          set -euo pipefail
-          host="${REGISTRY#oci://}"
-          host="${host%%/*}"
-          echo "$TOKEN" | nix shell nixpkgs#kubernetes-helm --command \
-            helm registry login "$host" --username "${{ github.actor }}" --password-stdin
+        # The house ladder, once: App installation token (preferred, measured
+        # working against ghcr 2026-08-22) > BOT_PAT_PUSH > GHCR_TOKEN >
+        # GITHUB_TOKEN. The hand-rolled helm login this replaced never
+        # considered the app token, so token-source: app (the zero-PAT path)
+        # logged in with a repo-scoped GITHUB_TOKEN that 403s on org-package
+        # push. docker client: helm-oci-publish runs as a container and reads
+        # ~/.docker/config.json, not helm's own config.
+        uses: pleme-io/actions/registry-login@main
+        with:
+          registry: ${{ inputs.registry }}
+          client: docker
+          username: ${{ github.actor }}
+          app-token: ${{ steps.token.outputs.app-token }}
+          bot-pat: ${{ secrets.BOT_PAT_PUSH }}
+          ghcr-token: ${{ secrets.GHCR_TOKEN }}
+          github-token: ${{ secrets.GITHUB_TOKEN || github.token }}
 
       - name: Lint, package & push chart
         uses: pleme-io/actions/helm-oci-publish@main
