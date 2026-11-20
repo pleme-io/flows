@@ -1,0 +1,95 @@
+# Reusable workflow: publish every chart whose files changed in the push.
+#
+# The repo-facing half of the fleet's chart delivery pattern (helm-publish.yml
+# is the per-chart half): detect which chart directories under `charts/`
+# moved, publish exactly those through helm-publish, skip the rest. A
+# consumer repo's whole trigger is:
+#
+#   on:
+#     push:
+#       branches: [main]
+#       paths: ["charts/**"]
+#   jobs:
+#     publish:
+#       uses: pleme-io/flows/.github/workflows/charts-publish.yml@main
+#       secrets: inherit
+#
+# Chain depth: consumer(1) -> this(2) -> helm-publish(3) — legal at 4; do NOT
+# route this through the pleme-helm family composer, which would make it 5.
+#
+# Changed-only: a chart whose files did not move is not re-pushed, so a docs
+# commit cannot resurrect an old version over the registry's.
+#
+# Credential shape (the pattern's point): the App installation token minted
+# on a self-hosted runner host (token-source: app) is registry-login's
+# preferred rung — no PAT exists anywhere in the publish path. Pull-side,
+# nodes rotate the registry secret by the same App mint
+# (pleme.nixos.ghcrPullSecret, nix repo); the App's private key in SOPS is
+# the only long-lived credential in the whole chain.
+#
+# NOTE: pushes 403 until the org grants the App access to a target package
+# the first time (org Settings → Packages) — the run fails loudly, which is
+# the correct behaviour for a pipeline waiting on a grant.
+
+name: charts-publish
+
+on:
+  workflow_call:
+    inputs:
+      chartsPath:
+        description: "Directory holding one subdirectory per chart"
+        type: string
+        default: "charts"
+      registry:
+        description: "OCI registry URL (oci:// scheme)"
+        type: string
+        default: "oci://ghcr.io/pleme-io/charts"
+      runner:
+        description: "Runner label for the publish job; a self-hosted label enables the App-token rung"
+        type: string
+        default: "pleme-private"
+      token-source:
+        description: "github-token source for helm-publish (app | pat | none)"
+        type: string
+        default: "app"
+
+jobs:
+  changes:
+    name: Changed charts
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - id: set
+        run: |
+          set -euo pipefail
+          before="${{ github.event.before }}"
+          if [ -z "$before" ] || [ "$before" = "0000000000000000000000000000000000000000" ]; then
+            before="HEAD~1"
+          fi
+          base="${{ inputs.chartsPath }}"
+          dirs=$(git diff --name-only "$before" "${{ github.sha }}" -- "$base/" \
+            | cut -d/ -f2 | sort -u \
+            | while read -r d; do [ -f "$base/$d/Chart.yaml" ] && echo "$d"; done)
+          matrix=$(printf '%s\n' "$dirs" | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "publishing: $matrix"
+
+  publish:
+    name: Publish
+    needs: changes
+    if: needs.changes.outputs.matrix != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        chart: ${{ fromJson(needs.changes.outputs.matrix) }}
+    uses: ./.github/workflows/helm-publish.yml
+    with:
+      chartPath: ./${{ inputs.chartsPath }}/${{ matrix.chart }}
+      registry: ${{ inputs.registry }}
+      runner: ${{ inputs.runner }}
+      token-source: ${{ inputs.token-source }}
+    secrets: inherit
