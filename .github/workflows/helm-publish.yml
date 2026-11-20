@@ -18,6 +18,11 @@
 #   - Falls back to `helm lint && helm package && helm push` for repos that
 #     don't yet have forge available in their flake.
 #
+# Registry credential (ghcr): the job's own GITHUB_TOKEN, with
+# `permissions: packages: write`. App installation tokens CANNOT talk to
+# ghcr (see the Registry login step). Chart packages are public — pulls are
+# anonymous, so there is no pull-side credential at all.
+#
 # Expected chart layout: a directory containing a `Chart.yaml`. If the chart
 # depends on a sibling library chart (file://...), pass libChartDir.
 
@@ -85,21 +90,25 @@ jobs:
         with:
           github-token: ${{ steps.token.outputs.token || secrets.GITHUB_TOKEN }}
       - name: Registry login
-        # The house ladder, once: App installation token (preferred, measured
-        # working against ghcr 2026-08-22) > BOT_PAT_PUSH > GHCR_TOKEN >
-        # GITHUB_TOKEN. The hand-rolled helm login this replaced never
-        # considered the app token, so token-source: app (the zero-PAT path)
-        # logged in with a repo-scoped GITHUB_TOKEN that 403s on org-package
-        # push. docker client: helm-oci-publish runs as a container and reads
+        # ghcr.io accepts PATs and the calling repo's own GITHUB_TOKEN — and
+        # NOTHING else: GitHub App installation tokens are rejected by the
+        # registry even with packages:write (login succeeds, every registry
+        # operation 403s "denied"; measured 2026-11-20, community
+        # discussions 171423 + 24636). The earlier "measured working
+        # 2026-08-22" receipt was a LOGIN-only probe — the exact trap. So
+        # this caller passes no app-token rung: the job's GITHUB_TOKEN
+        # (permissions: packages: write above) is the push credential, and
+        # the target package must be linked to this repository — org default
+        # "inherit access from source repository" is ON (measured
+        # 2026-11-20), so packages this repo creates are linked at birth;
+        # pre-existing ones need the one-time link (package page → Connect
+        # Repository). docker client: helm-oci-publish reads
         # ~/.docker/config.json, not helm's own config.
         uses: pleme-io/actions/registry-login@main
         with:
           registry: ${{ inputs.registry }}
           client: docker
           username: ${{ github.actor }}
-          app-token: ${{ steps.token.outputs.app-token }}
-          bot-pat: ${{ secrets.BOT_PAT_PUSH }}
-          ghcr-token: ${{ secrets.GHCR_TOKEN }}
           github-token: ${{ secrets.GITHUB_TOKEN || github.token }}
 
       - name: Lint, package & push chart
