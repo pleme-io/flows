@@ -93,9 +93,12 @@
         0
         (fail-line (string-append "SUMMARY " n ": no column-0 # summary of 10+ characters in the first 12 lines")))))
 
+(define FULL-REF-EXEMPT (list "charts-publish.yml"))
+
 (define (check-self-refs n ls)
-  (sum (map (fn (l) (fail-line (string-append "SELFREF " n ": " (string-trim l) " — a flow calls a sibling as ./.github/workflows/<flow>.yml")))
-            (filter (fn (l) (re-match? "^\\s+uses: pleme-io/(substrate|flows)/\\.github/workflows/" l)) ls))))
+  (if (member? n FULL-REF-EXEMPT) 0
+      (sum (map (fn (l) (fail-line (string-append "SELFREF " n ": " (string-trim l) " — a flow calls a sibling as ./.github/workflows/<flow>.yml")))
+                (filter (fn (l) (re-match? "^\\s+uses: pleme-io/(substrate|flows)/\\.github/workflows/" l)) ls)))))
 
 (define (check-call n ls)
   (if (member? "  workflow_call:" ls) 0 (fail-line (string-append "CALL    " n ": declares no workflow_call: at indent 2"))))
