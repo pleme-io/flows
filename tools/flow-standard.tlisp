@@ -94,6 +94,11 @@
         (fail-line (string-append "SUMMARY " n ": no column-0 # summary of 10+ characters in the first 12 lines")))))
 
 (define FULL-REF-EXEMPT (list "charts-publish.yml"))
+;; The one exemption is the RETIRED charts-publish, kept as the record of
+;; why it cannot exist: matrix + uses: startup_fails on GitHub (measured
+;; 2026-11-21, helmworks runs 44862261383/44862322663). A './' sibling ref
+;; breaks any cross-repo caller (it resolves in the ROOT caller's repo), so
+;; a called reusable may never use one. LIVE flows must not land here.
 
 (define (check-self-refs n ls)
   (if (member? n FULL-REF-EXEMPT) 0
